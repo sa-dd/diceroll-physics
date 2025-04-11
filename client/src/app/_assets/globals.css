@@ -1,0 +1,78 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@font-face {
+  font-family: "StickyPops";
+  src: url("/fonts/StickyPops.otf") format("opentype");
+  font-weight: normal;
+  font-style: normal;
+}
+
+@layer base {
+  :root {
+    --white: #fff;
+    --dark: #040404;
+    --dark2: #0c0c0c;
+    --black: #000;
+    --border: #0d0d0d;
+    --border2: #ffffff08;
+    --muted: #ffffff75;
+    --muted2: #ffffffbf;
+    --green: #1ccc8d;
+    --red: #ff2b5e;
+
+    --radius: 4px;
+  }
+
+  body {
+    font-family: var(--font-inter-tight);
+    background: var(--black);
+    overflow-x: hidden;
+    overflow-y: hidden;
+    user-select: none !important;
+    color: var(--white);
+    height: 100vh;
+    font-weight: 400;
+  }
+
+  * {
+    user-select: none !important;
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+
+  *::-webkit-scrollbar {
+    display: none;
+  }
+
+  p {
+    font-size: 14px;
+    font-weight: 500;
+    color: var(--white);
+  }
+
+  b {
+    font-size: 14px;
+    font-weight: 600 !important;
+    color: var(--white);
+  }
+
+  h6 {
+    font-size: 12px;
+    font-weight: 400;
+    color: var(--white);
+  }
+
+  h2 {
+    font-size: 32px;
+    font-weight: 900;
+    font-style: italic;
+    line-height: 100%;
+  }
+
+  h1 {
+    font-family: "StickyPops", sans-serif;
+    font-size: 32px;
+  }
+}
