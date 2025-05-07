@@ -5,8 +5,8 @@ import { PLAY_AREA, WALL_THICKNESS } from "./game-config";
 
 export type EulerRotation = { x: number; y: number; z: number };
 
-// Константа для включения/выключения контуров
-const SHOW_WALL_OUTLINES = false;
+// Changed to true to make walls visible for debugging
+const SHOW_WALL_OUTLINES = true;
 
 export const createPhysicsWall = (
   world: CANNON.World,
@@ -153,4 +153,4 @@ export const spawnWalls = (
   if (SHOW_WALL_OUTLINES) {
     createVisualWall(scene, pos, halfExtents);
   }
-};
+};;

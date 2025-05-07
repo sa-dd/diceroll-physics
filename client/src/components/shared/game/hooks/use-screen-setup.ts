@@ -2,6 +2,7 @@
 import { useEffect, useRef } from "react";
 import * as THREE from "three";
 import * as CANNON from "cannon-es";
+import CannonDebugger from "cannon-es-debugger"
 import { spawnWalls } from "../game-walls";
 
 export type Cube = {
