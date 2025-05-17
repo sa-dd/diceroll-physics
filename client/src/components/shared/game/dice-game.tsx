@@ -73,11 +73,16 @@ export const DiceGame: React.FC<Props> = ({ className }) => {
   const floatingInitializedRef = useRef<boolean>(false)
   
   // State for tracking if movement is unlocked by shake
-  // Set this to false by default to enforce shake detection
+  // IMPORTANT FIX: Set this to false by default to enforce shake detection
   const [movementUnlocked, setMovementUnlocked] = useState(false)
   
   // State for floating mode tracking
   const [isFloating, setIsFloating] = useState(true) // Default to true for initial state
+  
+  // NEW: State for dice rigging
+  const [targetValues, setTargetValues] = useState<number[]>([6, 6, 6]) // Default to triple sixes
+  const [riggingEnabled, setRiggingEnabled] = useState<boolean>(false)   // Toggle for rigging
+  const [cheatMenuOpen, setCheatMenuOpen] = useState<boolean>(false)     // Cheat menu visibility
   
   // State for accelerometer values - only care about X for movement
   const [accelerometerValues, setAccelerometerValues] = useState<{
@@ -217,7 +222,10 @@ export const DiceGame: React.FC<Props> = ({ className }) => {
     initFloating,  
     startReplay,
     hasRecording,
-    isReplaying
+    isReplaying,
+    // NEW: Add rigging functions
+    setTargetValues: setDiceTargetValues,
+    rigRecording
   } = useAccelerometerDice(
     cubesRef, 
     isThrowingRef, 
@@ -243,6 +251,13 @@ export const DiceGame: React.FC<Props> = ({ className }) => {
   useEffect(() => {
     isThrowingRef.current = isThrowing
   }, [isThrowing])
+
+  // NEW: Update dice target values when they change in UI
+  useEffect(() => {
+    if (riggingEnabled) {
+      setDiceTargetValues(targetValues);
+    }
+  }, [targetValues, riggingEnabled, setDiceTargetValues]);
 
   // NEW: Initialize floating animation at startup
   useEffect(() => {
@@ -461,8 +476,8 @@ export const DiceGame: React.FC<Props> = ({ className }) => {
     // Start with low gravity for floating
     world.gravity.set(0, -1, 0)
     world.allowSleep = true
-    world.defaultContactMaterial.friction = 0.05  
-    world.defaultContactMaterial.restitution = 0.5  
+    world.defaultContactMaterial.friction = 0.2  
+    world.defaultContactMaterial.restitution = 0.3  
 
     worldRef.current = world
 
@@ -478,7 +493,7 @@ export const DiceGame: React.FC<Props> = ({ className }) => {
 
     const cubeWallContact = new CANNON.ContactMaterial(cubeMaterial, wallMaterial, {
       friction: 0.4,
-      restitution: 0.4,
+      restitution: 0.2,
       contactEquationStiffness: 1e8,  
       contactEquationRelaxation: 3,   
       frictionEquationStiffness: 1e8, 
@@ -645,7 +660,7 @@ export const DiceGame: React.FC<Props> = ({ className }) => {
     if (motion) {
       calibrate(motion);
       
-      // When recalibrating, lock movement and require shake
+      // IMPORTANT FIX: When recalibrating, lock movement and require shake
       setMovementUnlocked(false);
       
       // But keep floating mode
@@ -656,7 +671,51 @@ export const DiceGame: React.FC<Props> = ({ className }) => {
     }
   }, [motion, calibrate, initFloating]);
 
-  // Handle replay button click
+  // NEW: Function to toggle cheat menu
+  const toggleCheatMenu = useCallback(() => {
+    setCheatMenuOpen(!cheatMenuOpen);
+  }, [cheatMenuOpen]);
+
+  // NEW: Function to toggle rigging
+  const toggleRigging = useCallback(() => {
+    setRiggingEnabled(!riggingEnabled);
+    
+    // If enabling rigging, set the target values
+    if (!riggingEnabled) {
+      setDiceTargetValues(targetValues);
+      console.log("Dice rigging enabled with values:", targetValues);
+    } else {
+      console.log("Dice rigging disabled");
+    }
+  }, [riggingEnabled, targetValues, setDiceTargetValues]);
+
+  // NEW: Function to update a single die value
+  const updateDieValue = useCallback((index: number, value: number) => {
+    if (index >= 0 && index < 3 && value >= 1 && value <= 6) {
+      const newValues = [...targetValues];
+      newValues[index] = value;
+      setTargetValues(newValues);
+      
+      // Update active target values if rigging is enabled
+      if (riggingEnabled) {
+        setDiceTargetValues(newValues);
+      }
+    }
+  }, [targetValues, riggingEnabled, setDiceTargetValues]);
+
+  // NEW: Function to set a dice preset
+  const setDicePreset = useCallback((preset: number[]) => {
+    if (preset.length === 3 && preset.every(val => val >= 1 && val <= 6)) {
+      setTargetValues(preset);
+      
+      // Update active target values if rigging is enabled
+      if (riggingEnabled) {
+        setDiceTargetValues(preset);
+      }
+    }
+  }, [riggingEnabled, setDiceTargetValues]);
+
+  // Handle replay button click with rigging support
   const handleReplay = useCallback(() => {
     if (hasRecording()) {
       console.log("Starting replay...");
@@ -667,25 +726,113 @@ export const DiceGame: React.FC<Props> = ({ className }) => {
         resetDicePositions();
         
         setTimeout(() => {
+          // Apply rigging if enabled
+          if (riggingEnabled) {
+            setDiceTargetValues(targetValues);
+            rigRecording();
+          }
+          
           // Start replay
           startReplay();
         }, 200);
       }, 50);
     }
-  }, [hasRecording, resetDicePositions, startReplay]);
+  }, [hasRecording, resetDicePositions, startReplay, riggingEnabled, targetValues, setDiceTargetValues, rigRecording]);
 
   return (
     <>
       <button
-        className="fixed top-[100px] left-1/2 -translate-x-1/2 w-[200px] h-10 z-[99] bg-blue-500 text-white rounded-md"
+        className="fixed top-[20px] left-1/2 -translate-x-1/2 w-[200px] h-10 z-[99] bg-blue-500 text-white rounded-md"
         onClick={handleRequestAccess}
       >
         {motionAccessGranted ? "Access Granted" : "Enable Sensors"}
       </button>
 
+      {/* Secret cheat button - positioned at bottom right for easier mobile access */}
+      <button
+        className="fixed bottom-[20px] right-[20px] w-14 h-14 z-[99] bg-black bg-opacity-30 text-white rounded-full flex items-center justify-center opacity-40"
+        onClick={toggleCheatMenu}
+      >
+        🎲
+      </button>
+
+      {/* Cheat menu - positioned from bottom for mobile ergonomics */}
+      {cheatMenuOpen && (
+        <div className="fixed bottom-[70px] right-[20px] w-[280px] z-[100] bg-gray-800 bg-opacity-90 rounded-lg p-4 text-white shadow-lg">
+          <div className="flex justify-between items-center mb-4">
+            <h3 className="text-lg font-bold text-yellow-400">🎲 Dice Cheat Menu</h3>
+            <button 
+              className="text-gray-400 hover:text-white" 
+              onClick={toggleCheatMenu}
+            >
+              ✕
+            </button>
+          </div>
+          
+          <div className="flex items-center mb-4">
+            <span className="mr-2">Rigging:</span>
+            <button 
+              className={`px-3 py-1 rounded ${riggingEnabled ? 'bg-green-600' : 'bg-red-600'}`}
+              onClick={toggleRigging}
+            >
+              {riggingEnabled ? 'ON' : 'OFF'}
+            </button>
+          </div>
+          
+          <div className="mb-4">
+            <div className="text-sm text-gray-300 mb-2">Target Values:</div>
+            <div className="flex space-x-2">
+              {[0, 1, 2].map(dieIndex => (
+                <div key={dieIndex} className="flex flex-col items-center">
+                  <div className="bg-white text-black w-12 h-12 rounded-md flex items-center justify-center text-xl font-bold mb-1">
+                    {targetValues[dieIndex]}
+                  </div>
+                  <div className="flex space-x-1">
+                    <button 
+                      className="w-6 h-6 bg-gray-600 rounded text-xs" 
+                      onClick={() => updateDieValue(dieIndex, Math.max(1, targetValues[dieIndex] - 1))}
+                    >
+                      -
+                    </button>
+                    <button 
+                      className="w-6 h-6 bg-gray-600 rounded text-xs"
+                      onClick={() => updateDieValue(dieIndex, Math.min(6, targetValues[dieIndex] + 1))}
+                    >
+                      +
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+          
+          <div className="mb-4">
+            <div className="text-sm text-gray-300 mb-2">Presets:</div>
+            <div className="grid grid-cols-2 gap-2">
+              <button className="bg-gray-700 hover:bg-gray-600 px-2 py-1 rounded text-sm" onClick={() => setDicePreset([6, 6, 6])}>
+                Triple 6's
+              </button>
+              <button className="bg-gray-700 hover:bg-gray-600 px-2 py-1 rounded text-sm" onClick={() => setDicePreset([1, 1, 1])}>
+                Triple 1's
+              </button>
+              <button className="bg-gray-700 hover:bg-gray-600 px-2 py-1 rounded text-sm" onClick={() => setDicePreset([4, 5, 6])}>
+                4-5-6
+              </button>
+              <button className="bg-gray-700 hover:bg-gray-600 px-2 py-1 rounded text-sm" onClick={() => setDicePreset([1, 2, 3])}>
+                1-2-3
+              </button>
+            </div>
+          </div>
+          
+          <div className="text-xs text-gray-400 italic">
+            Roll the dice as normal, then replay with your chosen values!
+          </div>
+        </div>
+      )}
+
       {/* SHAKE INSTRUCTION - Only show when movement is locked */}
       {motionAccessGranted && !movementUnlocked && !isThrowing && !isVisible && !isReplaying() && (
-        <div className="fixed top-[40px] left-1/2 -translate-x-1/2 w-[250px] z-[99] flex flex-col items-center">
+        <div className="fixed top-[80px] left-1/2 -translate-x-1/2 w-[250px] z-[99] flex flex-col items-center">
           <div className="text-center text-white rounded-md bg-orange-500 px-3 py-2 text-sm w-full">
             <div className="font-bold">
               SHAKE TO UNLOCK
@@ -699,7 +846,7 @@ export const DiceGame: React.FC<Props> = ({ className }) => {
 
       {/* WAITING FOR INITIAL MOVEMENT - Only show after shake unlock */}
       {motionAccessGranted && movementUnlocked && !deadzoneState.hasMoved && !isThrowing && !isVisible && !isReplaying() && (
-        <div className="fixed top-[40px] left-1/2 -translate-x-1/2 w-[250px] z-[99] flex flex-col items-center">
+        <div className="fixed top-[80px] left-1/2 -translate-x-1/2 w-[250px] z-[99] flex flex-col items-center">
           <div className="text-center text-white rounded-md bg-blue-500 px-3 py-2 text-sm w-full">
             <div className="font-bold">
               UNLOCKED! TILT LEFT/RIGHT TO MOVE DICE
@@ -714,16 +861,16 @@ export const DiceGame: React.FC<Props> = ({ className }) => {
      
       {/* Standard instruction - after moving but not in deadzone */}
       {motionAccessGranted && movementUnlocked && deadzoneState.hasMoved && !deadzoneState.inDeadzone && !isThrowing && !isVisible && !isReplaying() && (
-        <div className="fixed top-[40px] left-1/2 -translate-x-1/2 w-[250px] h-10 z-[99] text-center bg-black text-white rounded-md bg-opacity-50 flex items-center justify-center">
+        <div className="fixed top-[80px] left-1/2 -translate-x-1/2 w-[250px] h-10 z-[99] text-center bg-black text-white rounded-md bg-opacity-50 flex items-center justify-center">
           Tilt device left/right to move dice or hold still to throw
         </div>
       )}
 
       {/* On-screen dice results display */}
-      {rollResults.length > 0 && !isThrowing && (!isReplaying() || (isReplaying() && hasRecording())) && (
+      {rollResults.length > 0 && !isThrowing && !isReplaying() && (
         <div className="fixed bottom-8 left-1/2 -translate-x-1/2 z-[100] flex flex-col items-center">
           <div className="flex space-x-4 mb-2">
-            {(isReplaying() ? [6, 6, 6] : rollResults).map((value, index) => (
+            {rollResults.map((value, index) => (
               <div 
                 key={index} 
                 className="w-15 h-14 bg-white rounded-lg flex items-center justify-center"
@@ -740,12 +887,47 @@ export const DiceGame: React.FC<Props> = ({ className }) => {
             ))}
           </div>
           
+          <div 
+            className="bg-black text-white py-2 px-6 rounded-full font-bold text-xl"
+            style={{ boxShadow: '0 2px 6px rgba(0, 0, 0, 0.3)' }}
+          >
+            Total: {diceTotal}
+          </div>
+          
+          {/* NEW: Show rigging indicator if enabled */}
+          {riggingEnabled && (
+            <div className="mt-2 px-3 py-1 bg-yellow-500 text-black text-xs font-bold rounded-full">
+              🎲 RIGGED ROLL 🎲
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Replay button - only show when a recording exists and dice are settled */}
+      {hasRecording() && rollResults.length > 0 && !isThrowing && !isReplaying() && !isVisible && (
+        <div className="fixed left-1/2 bottom-24 -translate-x-1/2 z-[100]">
+          <button
+            onClick={handleReplay}
+            className={`${riggingEnabled ? 'bg-purple-700' : 'bg-purple-600'} text-white px-6 py-3 rounded-lg font-bold text-lg hover:bg-purple-700 transition-colors shadow-lg flex items-center space-x-2`}
+          >
+            <span>↺</span>
+            <span>
+              {riggingEnabled ? `Replay Rigged Roll (${targetValues.join('-')})` : 'Replay Last Roll'}
+            </span>
+          </button>
+        </div>
+      )}
+
+      {/* Replaying indicator */}
+      {isReplaying() && (
+        <div className="fixed top-[80px] left-1/2 -translate-x-1/2 w-[250px] h-10 z-[99] text-center bg-purple-500 text-white rounded-md flex items-center justify-center font-bold">
+          {riggingEnabled ? 'Replaying Rigged Roll...' : 'Replaying...'}
         </div>
       )}
 
       {/* Instructions for throwing mode */}
       {motionAccessGranted && isThrowing && !isReplaying() && (
-        <div className="fixed top-[40px] left-1/2 -translate-x-1/2 w-[250px] h-10 z-[99] text-center bg-green-500 text-white rounded-md flex items-center justify-center font-bold">
+        <div className="fixed top-[80px] left-1/2 -translate-x-1/2 w-[250px] h-10 z-[99] text-center bg-green-500 text-white rounded-md flex items-center justify-center font-bold">
           Throwing dice...
         </div>
       )}
