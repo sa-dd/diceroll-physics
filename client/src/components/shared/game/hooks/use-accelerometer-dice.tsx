@@ -7,8 +7,8 @@ import type { Cube } from "../game-board"
 import type { DeviceMotionData } from "./use-device-motion"
 
 // Constants for accelerometer-based movement
-const GRAVITY_STRENGTH = 600
-const IMPULSE_MULTIPLIER = 120.0
+const GRAVITY_STRENGTH = 700
+const IMPULSE_MULTIPLIER = 150.0
 const TORQUE_MULTIPLIER = 0.2
 const TILT_THRESHOLD = 0.25
 const DEAD_ZONE = 0.9
@@ -22,15 +22,22 @@ const FLOAT_ROTATION_SPEED = 0.03
 
 // Physics parameters
 const LINEAR_DAMPING = 0.2
-const ANGULAR_DAMPING = 0.3
+const ANGULAR_DAMPING = 0.9
 const FLOATING_LINEAR_DAMPING = 0.1
 const FLOATING_ANGULAR_DAMPING = 0.1
+const GROUND_LINEAR_DAMPING = 0.2  // Higher damping when dice hit ground
+const GROUND_ANGULAR_DAMPING = 0.35  // Higher angular damping when dice hit ground
+const GROUND_Z_DAMPING_MULTIPLIER = 0.8  // Extra damping in Z direction
 const VELOCITY_THRESHOLD = 0.8
 const ANGULAR_VELOCITY_THRESHOLD = 0.1
 const STABLE_TIMEOUT = 100
-const MAX_VELOCITY = 80
-const MAX_ANGULAR_VELOCITY = 10
+const MAX_VELOCITY = 100
+const MAX_ANGULAR_VELOCITY = 5
 const DEADZONE_THROW_DELAY = 50
+
+// Boundary parameters to keep dice in camera view
+const Z_MIN_BOUNDARY = -15  // Forward boundary (keep dice from rolling too far forward)
+const Z_RESTORE_FORCE = 15  // Force to apply to bring dice back in bounds
 
 // Recording constants
 const RECORD_INTERVAL = 0.016 // ~60 FPS
@@ -41,6 +48,11 @@ const TRANSITION_FRAMES = 15  // Number of frames to smoothly transition to rigg
 const VELOCITY_SETTLE_THRESHOLD = 2.0  // Velocity threshold to identify when dice are nearly settled
 const MIDAIR_HEIGHT_THRESHOLD = 2.0    // Height above which dice are considered in mid-air
 const PHYSICS_INFLUENCE_FRAMES = 40    // Number of frames for gradual physics influence
+
+// Throw constants
+const DEFAULT_THROW_FORCE_Y = 2.0      // Upward force
+const DEFAULT_THROW_FORCE_Z = -32.0    // Forward force (negative Z)
+const DEFAULT_THROW_STRENGTH = 1.5     // Throw strength multiplier
 
 // Face orientation mapping (MUST match Three.js material order)
 const FACE_NORMALS = new Map<number, THREE.Vector3>([
@@ -672,31 +684,32 @@ export const useAccelerometerDice = (
   }, [findMidairPoint, findSettleIndex, createNaturalTransitionFrames, createTransitionFrames]);
 
   const updateDeadzoneState = useCallback(() => {
-    if (!inDeadzone || deadzoneTimer === null) return
+    if (!inDeadzone || deadzoneTimer === null) return;
     
-    const now = Date.now()
-    const elapsed = now - deadzoneTimer
-    const newProgress = (elapsed / DEADZONE_THROW_DELAY) * 100
+    const now = Date.now();
+    const elapsed = now - deadzoneTimer;
+    const newProgress = (elapsed / DEADZONE_THROW_DELAY) * 100;
     
-    setDeadzoneProgress(Math.min(100, newProgress))
+    setDeadzoneProgress(Math.min(100, newProgress));
     
-    if (elapsed >= DEADZONE_THROW_DELAY && lastMotion.current) {
-      console.log("DEADZONE TIMER COMPLETE - THROWING")
+    if (elapsed >= DEADZONE_THROW_DELAY) {
+      console.log("DEADZONE TIMER COMPLETE - THROWING");
       
-      setInDeadzone(false)
-      setDeadzoneTimer(null)
-      setDeadzoneProgress(0)
+      setInDeadzone(false);
+      setDeadzoneTimer(null);
+      setDeadzoneProgress(0);
       
-      floatingModeRef.current = false
-      stopFloatingAnimation()
-      diceHitGroundRef.current = false
-      groundHitTimeRef.current = null
+      floatingModeRef.current = false;
+      stopFloatingAnimation();
+      diceHitGroundRef.current = false;
+      groundHitTimeRef.current = null;
       
-      startThrow(lastMotion.current)
+      // Use consistent throw direction regardless of device orientation
+      startThrow(DEFAULT_THROW_STRENGTH);
     }
     
-    animationFrameId.current = requestAnimationFrame(updateDeadzoneState)
-  }, [inDeadzone, deadzoneTimer])
+    animationFrameId.current = requestAnimationFrame(updateDeadzoneState);
+  }, [inDeadzone, deadzoneTimer]);
 
   const storeBasePositions = useCallback(() => {
     const positions: CANNON.Vec3[] = []
@@ -896,7 +909,8 @@ const getDiceValue = useCallback((cube: Cube): number => {
     setIsThrowing(false)
     isThrowingRef.current = false
   }, [setIsThrowing])
-// 2. Also modify the playbackFrame logic to freeze dice in their final positions
+
+// Modified playbackFrame to ensure dice stay in place after settling
 const playbackFrame = useCallback(() => {
   if (!replayState.current.isReplaying || replayState.current.recordedFrames.length === 0) {
     return
@@ -1006,8 +1020,6 @@ const playbackFrame = useCallback(() => {
     playbackFrame()
   }, [cubesRef, playbackFrame, rigRecording, setIsThrowing])
 
-  
-
   const hasRecording = useCallback(() => {
     return replayState.current.recordedFrames.length > 0
   }, [])
@@ -1030,8 +1042,7 @@ const playbackFrame = useCallback(() => {
     return filteredAcceleration.current
   }, [])
 
-  
-
+  // Modified function to apply damping and boundary constraints when dice hit ground
   const checkForGroundHit = useCallback(() => {
     if (!isThrowingRef.current || diceHitGroundRef.current || cubesRef.current.length === 0) {
       return
@@ -1042,17 +1053,47 @@ const playbackFrame = useCallback(() => {
     })
     
     if (groundHit && !diceHitGroundRef.current) {
-      console.log("DICE HIT GROUND")
+      console.log("DICE HIT GROUND - Applying enhanced damping")
       diceHitGroundRef.current = true
       groundHitTimeRef.current = Date.now()
       
       if (worldRef.current) {
         worldRef.current.gravity.set(0, -50, 0)
       }
+      
+      // Apply increased damping to limit motion, especially in Z direction
+      cubesRef.current.forEach(cube => {
+        cube.body.linearDamping = GROUND_LINEAR_DAMPING
+        cube.body.angularDamping = GROUND_ANGULAR_DAMPING
+        
+        // Apply extra damping to Z velocity to prevent rolling out of view
+        if (cube.body.velocity.z < 0) {  // If moving forward (negative Z)
+          const dampedZVel = cube.body.velocity.z * (1 - GROUND_Z_DAMPING_MULTIPLIER * 0.05)
+          cube.body.velocity.z = dampedZVel
+        }
+      })
+    }
+    
+    // Check boundary constraints for all dice
+    if (diceHitGroundRef.current) {
+      cubesRef.current.forEach(cube => {
+        // Check if dice are moving too far forward (negative Z)
+        if (cube.body.position.z < Z_MIN_BOUNDARY) {
+          // Apply a restoring force to push dice back into view
+          const zForce = (Z_MIN_BOUNDARY - cube.body.position.z) * Z_RESTORE_FORCE
+          cube.body.applyForce(
+            new CANNON.Vec3(0, 0, zForce),
+            cube.body.position
+          )
+          
+          // Apply additional damping to z velocity
+          cube.body.velocity.z *= 0.5
+        }
+      })
     }
   }, [cubesRef, isThrowingRef, worldRef])
 
-// 1. Modify the checkIfDiceSettled function to ensure dice stay in place after settling
+// Modified checkIfDiceSettled to ensure dice stay in place after settling
 const checkIfDiceSettled = useCallback(() => {
   if (!isThrowingRef.current || cubesRef.current.length === 0) return
   
@@ -1265,71 +1306,60 @@ const checkIfDiceSettled = useCallback(() => {
     groundHitTimeRef.current = null
   }, [])
 
+  // Modified startThrow function to always apply force in -Z (forward) and Y (up) direction
   const startThrow = useCallback(
-    (motion: DeviceMotionData, throwStrength = 1.2) => {
-      console.log("THROW STARTED")
+    (throwStrength = DEFAULT_THROW_STRENGTH) => {
+      console.log("THROW STARTED with strength:", throwStrength)
       
       if (isThrowingRef.current) {
         console.log("Already throwing, skipping")
         return
       }
       
+      // Reset states
       setInDeadzone(false)
-      setDeadzoneTimer(null)
-      setDeadzoneProgress(0)
       diceHitGroundRef.current = false
       groundHitTimeRef.current = null
       setRollResults([])
       setIsThrowing(true)
       isThrowingRef.current = true
       isReleased.current = false
-      floatingModeRef.current = false
-      stopFloatingAnimation()
       removeAllConstraints()
       
-      const tiltX = neutralAccelRef.current && motion.accelerationIncludingGravity.x !== null
-        ? motion.accelerationIncludingGravity.x - neutralAccelRef.current.x
-        : 0
-      
-      const normalizedTiltX = Math.max(-1, Math.min(1, tiltX / 5.0))
-      
+      // Apply fixed throw velocity in -Z (forward) and Y (up) directions
       throwVelocity.current.set(
-        0,
-        4 * throwStrength,  // Reduced upward velocity for more downward trajectory
-        -32.0 * throwStrength  // Increased forward force for more consistent throws
+        0,  // No X velocity 
+        DEFAULT_THROW_FORCE_Y * throwStrength,  // Upward force
+        DEFAULT_THROW_FORCE_Z * throwStrength   // Forward force (negative Z)
       )
       
+      // Strong gravity for consistent downward trajectory
       if (worldRef.current) {
-        // Increase gravity for a more pronounced downward arc
-        worldRef.current.gravity.set(0, -35, 0)
+        worldRef.current.gravity.set(0, -40, 0)
       }
       
       cubesRef.current.forEach((cube) => {
         cube.body.wakeUp()
         cube.body.type = CANNON.Body.DYNAMIC
         
-        // Ensure consistent throw by reducing random variation and ensuring minimum Z force
-        const variationScale = 0.3  // Reduced from 0.4 for less randomness
+        // Small random variation for natural look but keep main direction consistent
+        const variationScale = 0.2
         
-        // Calculate velocities with reduced variation
-        const vx = throwVelocity.current.x + (Math.random() - 0.5) * variationScale * throwStrength;
+        const vx = (Math.random() - 0.5) * variationScale * throwStrength; // Small random X
         const vy = throwVelocity.current.y + (Math.random() - 0.5) * variationScale * throwStrength;
-        
-        // Calculate z velocity but ensure it's always strongly negative (forward throw)
-        let vz = throwVelocity.current.z + (Math.random() - 0.5) * variationScale * throwStrength;
-        // Ensure minimum forward force (never less than 80% of intended velocity)
-        vz = Math.min(vz, throwVelocity.current.z * 0.8);
+        const vz = throwVelocity.current.z + (Math.random() - 0.5) * variationScale * throwStrength;
         
         cube.body.velocity.set(vx, vy, vz);
         
-        // Reduced from 10 to 5 for less spin
-        const baseAngularVel = 2 * throwStrength;
+        // Apply consistent spin for natural tumbling
+        const baseAngularVel = 3 * throwStrength;
         cube.body.angularVelocity.set(
           (Math.random() - 0.5) * baseAngularVel,
           (Math.random() - 0.5) * baseAngularVel,
           (Math.random() - 0.5) * baseAngularVel
         )
         
+        // Lower damping for natural physics during initial throw
         cube.body.linearDamping = 0.1
         cube.body.angularDamping = 0.1
       })
@@ -1338,20 +1368,15 @@ const checkIfDiceSettled = useCallback(() => {
       replayState.current.isRigged = false
       startRecording()
       
-      console.log("Throw successfully initiated - constraints removed")
+      console.log("Throw successfully initiated with fixed direction")
       setHasMoved(false)
     },
     [cubesRef, isThrowingRef, removeAllConstraints, setIsThrowing, setRollResults, worldRef, stopFloatingAnimation, startRecording]
   )
 
-  const forceThrow = useCallback((throwStrength = 1.5) => {
-    if (!lastMotion.current) {
-      console.log("No motion data available for throw")
-      return
-    }
-    
-    startThrow(lastMotion.current, throwStrength)
-  }, [lastMotion, startThrow])
+  const forceThrow = useCallback((throwStrength = DEFAULT_THROW_STRENGTH) => {
+    startThrow(throwStrength)
+  }, [startThrow])
 
   const handleMotionUpdate = useCallback(
     (motion: DeviceMotionData) => {
@@ -1364,13 +1389,13 @@ const checkIfDiceSettled = useCallback(() => {
         return
       }
       
+      // Process and filter acceleration
       processAcceleration(motion)
       
       // Skip recording if replaying
       if (replayState.current.isRecording && !replayState.current.isReplaying) {
         recordFrame()
       }
-
 
       if (isThrowingRef.current && !replayState.current.isReplaying) {
         checkForGroundHit()
@@ -1589,9 +1614,9 @@ const checkIfDiceSettled = useCallback(() => {
     isFloatingMode,
     getGroundHitStatus,
     initFloating,
-    setTargetValues,  // Add the new rigging function to the exported API
+    setTargetValues,
     startReplay,
-    rigRecording,     // Export the rig function so it can be called manually if needed
+    rigRecording,
     hasRecording,
     isReplaying
   }
