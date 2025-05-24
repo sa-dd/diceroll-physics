@@ -1,10 +1,10 @@
 export const PLAY_AREA = {
   // Making all dimensions equal to create a cube
-  minX: -5,
-  maxX: 5,
+  minX: -6,
+  maxX: 6,
   minY: -9,
   maxY: 10,
-  minZ: -20,
+  minZ: -26,
   maxZ: 6,
 }
 
