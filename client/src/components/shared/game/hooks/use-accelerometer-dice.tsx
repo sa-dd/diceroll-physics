@@ -100,6 +100,13 @@ interface ShadowRecording {
   desiredResults?: number[]
 }
 
+interface DiceState {
+  position: { x: number, y: number, z: number }
+  quaternion: { x: number, y: number, z: number, w: number }
+  velocity: { x: number, y: number, z: number }
+  angularVelocity: { x: number, y: number, z: number }
+}
+
 export const useAccelerometerDice = (
   cubesRef: React.MutableRefObject<Cube[]>,
   isThrowingRef: React.MutableRefObject<boolean>,
@@ -109,7 +116,7 @@ export const useAccelerometerDice = (
   worldRef: React.MutableRefObject<CANNON.World | null>,
   removeAllConstraints: () => void,
   createDiceConstraints: () => void,
-  onShadowThrowNeeded: (throwStrength: number) => Promise<ShadowRecording>
+  onShadowThrowNeeded: (throwStrength: number, initialState?: DiceState[]) => Promise<ShadowRecording>
 ) => {
   const [inDeadzone, setInDeadzone] = useState(false)
   const [deadzoneTimer, setDeadzoneTimer] = useState<number | null>(null)
@@ -145,14 +152,73 @@ export const useAccelerometerDice = (
     currentFrameIndex: number
     isRigged: boolean
     riggedResults: number[]
+    isStreamingMode: boolean
   }>({
     isPlayingBack: false,
     recording: null,
     startTime: 0,
     currentFrameIndex: 0,
     isRigged: false,
-    riggedResults: []
+    riggedResults: [],
+    isStreamingMode: false
   })
+
+  // Helper functions for state management
+  const captureDiceState = useCallback((): DiceState[] => {
+    return cubesRef.current.map(cube => ({
+      position: {
+        x: cube.body.position.x,
+        y: cube.body.position.y,
+        z: cube.body.position.z
+      },
+      quaternion: {
+        x: cube.body.quaternion.x,
+        y: cube.body.quaternion.y,
+        z: cube.body.quaternion.z,
+        w: cube.body.quaternion.w
+      },
+      velocity: {
+        x: cube.body.velocity.x,
+        y: cube.body.velocity.y,
+        z: cube.body.velocity.z
+      },
+      angularVelocity: {
+        x: cube.body.angularVelocity.x,
+        y: cube.body.angularVelocity.y,
+        z: cube.body.angularVelocity.z
+      }
+    }));
+  }, [cubesRef])
+
+  const freezeMainDice = useCallback(() => {
+    console.log("FREEZING MAIN DICE - preventing drift during shadow recording");
+    cubesRef.current.forEach(cube => {
+      cube.body.type = CANNON.Body.KINEMATIC; // Frozen but can be moved programmatically
+      cube.body.velocity.set(0, 0, 0);
+      cube.body.angularVelocity.set(0, 0, 0);
+      cube.body.wakeUp(); // Keep awake for programmatic updates
+    });
+  }, [cubesRef])
+
+  const applyDiceState = useCallback((states: DiceState[]) => {
+    cubesRef.current.forEach((cube, index) => {
+      if (index < states.length) {
+        const state = states[index];
+        cube.body.position.set(state.position.x, state.position.y, state.position.z);
+        cube.body.quaternion.set(state.quaternion.x, state.quaternion.y, state.quaternion.z, state.quaternion.w);
+        cube.body.velocity.set(state.velocity.x, state.velocity.y, state.velocity.z);
+        cube.body.angularVelocity.set(state.angularVelocity.x, state.angularVelocity.y, state.angularVelocity.z);
+        cube.body.wakeUp();
+      }
+    });
+  }, [cubesRef])
+
+  const unfreezeMainDice = useCallback(() => {
+    cubesRef.current.forEach(cube => {
+      cube.body.type = CANNON.Body.DYNAMIC;
+      cube.body.wakeUp();
+    });
+  }, [cubesRef])
 
   const updateDeadzoneState = useCallback(() => {
     if (!inDeadzone || deadzoneTimer === null) return;
@@ -266,10 +332,22 @@ export const useAccelerometerDice = (
     }
   }, [cubesRef])
 
+  // Stream a single frame to main dice (called during shadow recording)
+  const streamFrameToMainDice = useCallback((frame: PhysicsFrame) => {
+    if (!playbackStateRef.current.isStreamingMode) return;
+    
+    console.log("Streaming frame to main dice:", frame.timestamp);
+    applyRecordedFrame(frame);
+  }, [applyRecordedFrame])
+
   // Update playback of recorded shadow throw
   const updatePlayback = useCallback(() => {
     const playback = playbackStateRef.current
-    if (!playback.isPlayingBack || !playback.recording || playback.recording.frames.length === 0) return
+    
+    // Skip if not in playback mode, or if we're in streaming mode (handled elsewhere)
+    if (!playback.isPlayingBack || playback.isStreamingMode) return
+    
+    if (!playback.recording || playback.recording.frames.length === 0) return
 
     const currentTime = Date.now()
     const elapsedTime = currentTime - playback.startTime
@@ -323,6 +401,7 @@ export const useAccelerometerDice = (
             playback.recording = null
             playback.isRigged = false
             playback.riggedResults = []
+            playback.isStreamingMode = false
             floatingModeRef.current = false
             stopFloatingAnimation()
           }, 50)
@@ -336,6 +415,108 @@ export const useAccelerometerDice = (
     
     requestAnimationFrame(updatePlayback)
   }, [applyRecordedFrame, interpolateFrame, setRollResults, setIsThrowing, stopFloatingAnimation, isThrowingRef, cubesRef])
+
+  // Execute shadow throw with immediate state freeze and streaming playback
+  const executeThrow = useCallback(async (throwStrength: number) => {
+    console.log("EXECUTING SHADOW THROW with immediate freeze, strength:", throwStrength)
+    
+    if (isThrowingRef.current) return
+    
+    // STEP 1: Immediately capture current state and freeze main dice
+    console.log("STEP 1: Capturing state and freezing main dice");
+    const frozenState = captureDiceState();
+    freezeMainDice();
+    
+    // STEP 2: Set throwing state and prepare world
+    isThrowingRef.current = true
+    setIsThrowing(true)
+    diceHitGroundRef.current = false
+    groundHitTimeRef.current = null
+    floatingModeRef.current = false
+    stopFloatingAnimation()
+    removeAllConstraints()
+
+    if (worldRef.current) {
+      worldRef.current.gravity.set(0, -50, 0)
+    }
+
+    // STEP 3: Initialize streaming playback immediately
+    console.log("STEP 3: Initializing streaming playback");
+    playbackStateRef.current = {
+      isPlayingBack: true,
+      recording: { frames: [], finalResults: [], isComplete: false },
+      startTime: Date.now(),
+      currentFrameIndex: 0,
+      isRigged: false,
+      riggedResults: [],
+      isStreamingMode: true
+    }
+
+    try {
+      // STEP 4: Start shadow recording with frozen state and streaming callback
+      console.log("STEP 4: Starting shadow recording with streaming...");
+      const shadowRecording = await onShadowThrowNeeded(throwStrength, frozenState);
+      
+      console.log("Shadow recording complete. Final results:", shadowRecording.finalResults);
+      
+      // STEP 5: Switch from streaming to final recording playback
+      playbackStateRef.current = {
+        isPlayingBack: true,
+        recording: shadowRecording,
+        startTime: Date.now(),
+        currentFrameIndex: 0,
+        isRigged: shadowRecording.isRigged || false,
+        riggedResults: (shadowRecording.isRigged && shadowRecording.desiredResults) ? shadowRecording.desiredResults : shadowRecording.finalResults,
+        isStreamingMode: false
+      }
+      
+      // Continue with regular playback for any remaining frames
+      requestAnimationFrame(updatePlayback)
+      
+    } catch (error) {
+      console.error("Shadow roll failed:", error)
+      // Fallback: unfreeze and do direct throw
+      unfreezeMainDice()
+      startDirectThrow(throwStrength)
+    }
+  }, [cubesRef, isThrowingRef, setIsThrowing, worldRef, onShadowThrowNeeded, updatePlayback, stopFloatingAnimation, removeAllConstraints, captureDiceState, freezeMainDice, unfreezeMainDice])
+
+  // Fallback direct throw for when shadow recording fails
+  const startDirectThrow = useCallback((throwStrength = DEFAULT_THROW_STRENGTH) => {
+    console.log("DIRECT THROW (fallback) initiated, strength:", throwStrength)
+    
+    if (worldRef.current) worldRef.current.gravity.set(0, -50, 0)
+    
+    const baseThrowVelocity = new CANNON.Vec3(
+      0, 
+      DEFAULT_THROW_FORCE_Y * throwStrength, 
+      DEFAULT_THROW_FORCE_Z * throwStrength
+    )
+    
+    cubesRef.current.forEach((cube) => {
+      cube.body.type = CANNON.Body.DYNAMIC
+      cube.body.wakeUp()
+      
+      const variationScale = 0.3 * throwStrength
+      const vx = baseThrowVelocity.x + (Math.random() - 0.5) * variationScale * 2
+      const vy = baseThrowVelocity.y + (Math.random() - 0.5) * variationScale
+      const vz = baseThrowVelocity.z + (Math.random() - 0.5) * variationScale * 3
+      
+      cube.body.velocity.set(vx, vy, vz)
+      
+      const baseAngularStrength = (4 + Math.random() * 4) * throwStrength
+      cube.body.angularVelocity.set(
+        (Math.random() - 0.5) * baseAngularStrength,
+        (Math.random() - 0.5) * baseAngularStrength,
+        (Math.random() - 0.5) * baseAngularStrength
+      )
+      
+      cube.body.linearDamping = 0.05
+      cube.body.angularDamping = 0.05
+    })
+    
+    setHasMoved(false)
+  }, [cubesRef, worldRef, setHasMoved])
 
   const applyPulsatingAnimation = useCallback(() => {
     if (!floatingModeRef.current || isThrowingRef.current) {
@@ -603,93 +784,6 @@ export const useAccelerometerDice = (
     groundHitTimeRef.current = null
   }, [])
 
-  // Execute shadow throw and playback the recording
-  const executeThrow = useCallback(async (throwStrength: number) => {
-    console.log("EXECUTING SHADOW THROW with strength:", throwStrength)
-    
-    if (isThrowingRef.current) return
-    
-    isThrowingRef.current = true
-    setIsThrowing(true)
-    diceHitGroundRef.current = false
-    groundHitTimeRef.current = null
-    floatingModeRef.current = false
-    stopFloatingAnimation()
-    removeAllConstraints()
-
-    try {
-      console.log("Requesting shadow roll recording...")
-      const shadowRecording = await onShadowThrowNeeded(throwStrength)
-      
-      console.log("Shadow roll recording received. Frames:", shadowRecording.frames.length, 
-                  "Rigged:", shadowRecording.isRigged, "Desired:", shadowRecording.desiredResults)
-      
-      if (worldRef.current) {
-        worldRef.current.gravity.set(0, -50, 0)
-      }
-      
-      cubesRef.current.forEach(cube => {
-        cube.body.type = CANNON.Body.DYNAMIC
-        cube.body.linearDamping = 0.05
-        cube.body.angularDamping = 0.05
-        cube.body.wakeUp()
-      })
-      
-      playbackStateRef.current = {
-        isPlayingBack: true,
-        recording: shadowRecording,
-        startTime: Date.now(),
-        currentFrameIndex: 0,
-        isRigged: shadowRecording.isRigged || false,
-        riggedResults: (shadowRecording.isRigged && shadowRecording.desiredResults) ? shadowRecording.desiredResults : shadowRecording.finalResults
-      }
-      
-      requestAnimationFrame(updatePlayback)
-      
-    } catch (error) {
-      console.error("Shadow roll failed:", error)
-      // Fallback to direct physics if shadow recording fails
-      startDirectThrow(throwStrength)
-    }
-  }, [cubesRef, isThrowingRef, setIsThrowing, worldRef, onShadowThrowNeeded, updatePlayback, stopFloatingAnimation, removeAllConstraints])
-
-  // Fallback direct throw for when shadow recording fails
-  const startDirectThrow = useCallback((throwStrength = DEFAULT_THROW_STRENGTH) => {
-    console.log("DIRECT THROW (fallback) initiated, strength:", throwStrength)
-    
-    if (worldRef.current) worldRef.current.gravity.set(0, -50, 0)
-    
-    const baseThrowVelocity = new CANNON.Vec3(
-      0, 
-      DEFAULT_THROW_FORCE_Y * throwStrength, 
-      DEFAULT_THROW_FORCE_Z * throwStrength
-    )
-    
-    cubesRef.current.forEach((cube) => {
-      cube.body.type = CANNON.Body.DYNAMIC
-      cube.body.wakeUp()
-      
-      const variationScale = 0.3 * throwStrength
-      const vx = baseThrowVelocity.x + (Math.random() - 0.5) * variationScale * 2
-      const vy = baseThrowVelocity.y + (Math.random() - 0.5) * variationScale
-      const vz = baseThrowVelocity.z + (Math.random() - 0.5) * variationScale * 3
-      
-      cube.body.velocity.set(vx, vy, vz)
-      
-      const baseAngularStrength = (4 + Math.random() * 4) * throwStrength
-      cube.body.angularVelocity.set(
-        (Math.random() - 0.5) * baseAngularStrength,
-        (Math.random() - 0.5) * baseAngularStrength,
-        (Math.random() - 0.5) * baseAngularStrength
-      )
-      
-      cube.body.linearDamping = 0.05
-      cube.body.angularDamping = 0.05
-    })
-    
-    setHasMoved(false)
-  }, [cubesRef, worldRef, setHasMoved])
-
   // Function to start throwing dice using shadow recording
   const startThrow = useCallback(
     (throwStrength = DEFAULT_THROW_STRENGTH) => {
@@ -917,6 +1011,7 @@ export const useAccelerometerDice = (
     isMovementEnabled,
     isFloatingMode,
     getGroundHitStatus,
-    initFloating
+    initFloating,
+    streamFrameToMainDice
   }
 }

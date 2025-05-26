@@ -182,6 +182,13 @@ const RIGGING_PRESETS: Record<RiggingPreset, RiggingPresetConfig> = {
   }
 };
 
+interface DiceState {
+  position: { x: number, y: number, z: number }
+  quaternion: { x: number, y: number, z: number, w: number }
+  velocity: { x: number, y: number, z: number }
+  angularVelocity: { x: number, y: number, z: number }
+}
+
 // Shadow constants
 const DEFAULT_THROW_FORCE_Y = 2.0
 const DEFAULT_THROW_FORCE_Z = -32.0
@@ -220,18 +227,43 @@ export const DiceGame: React.FC<Props> = ({ className }) => {
     frames: PhysicsFrame[]
     startTime: number
     resolvePromise: ((recording: ShadowRecording) => void) | null
+    streamingCallback: ((frame: PhysicsFrame) => void) | null
   }>({
     isRecording: false,
     frames: [],
     startTime: 0,
-    resolvePromise: null
+    resolvePromise: null,
+    streamingCallback: null
   });
 
   const [rollResults, setRollResults] = useState<number[]>([])
   const [isThrowing, setIsThrowing] = useState<boolean>(false)
   const isThrowingRef = useRef<boolean>(false)
   const [isVisible, setVisible] = useState(false)
-  const [accessGranted, setAccessGranted] = useState(false)
+  // State for motion readiness
+  const [motionReady, setMotionReady] = useState(false);
+    // Get device motion data using our new hook
+  const { 
+    motion, 
+    isShaking, 
+    accessGranted: motionAccessGranted, 
+    requestAccess: requestMotionAccess, 
+    revokeAccess: revokeMotionAccess 
+  } = useDeviceMotion({
+    shakeThreshold: 2.5
+  });
+
+  // Track when motion data is actually flowing
+  useEffect(() => {
+    if (motionAccessGranted && motion && 
+        motion.accelerationIncludingGravity.x !== null && 
+        motion.accelerationIncludingGravity.y !== null && 
+        motion.accelerationIncludingGravity.z !== null) {
+      setMotionReady(true);
+    } else {
+      setMotionReady(false);
+    }
+  }, [motionAccessGranted, motion]);
   const rollScreenAnimationTimeRef = useRef<number>(400)
   const neutralPositionSetRef = useRef<boolean>(false)
   const floatingInitializedRef = useRef<boolean>(false)
@@ -889,7 +921,7 @@ export const DiceGame: React.FC<Props> = ({ className }) => {
   const recordShadowFrame = useCallback(() => {
     if (!shadowRecordingRef.current.isRecording) return;
     
-    const SHADOW_SPEED_MULTIPLIER = 10;
+    const SHADOW_SPEED_MULTIPLIER = 6;
     const frameTime = shadowRecordingRef.current.frames.length * (1000 / 60) * SHADOW_SPEED_MULTIPLIER;
     
     const diceStates = shadowCubesRef.current.map(cube => ({
@@ -916,10 +948,17 @@ export const DiceGame: React.FC<Props> = ({ className }) => {
       }
     }));
     
-    shadowRecordingRef.current.frames.push({
+    const frame: PhysicsFrame = {
       timestamp: frameTime,
       diceStates
-    });
+    };
+    
+    shadowRecordingRef.current.frames.push(frame);
+    
+    // STREAMING: Send frame to main dice immediately if streaming callback is set
+    if (shadowRecordingRef.current.streamingCallback) {
+      shadowRecordingRef.current.streamingCallback(frame);
+    }
   }, []);
 
   const resetShadowDiceToFloatingState = useCallback(() => {
@@ -969,6 +1008,9 @@ export const DiceGame: React.FC<Props> = ({ className }) => {
     shadowRecordingRef.current.isRecording = false;
     shadowRollInProgressRef.current = false;
     
+    // Clear streaming callback
+    shadowRecordingRef.current.streamingCallback = null;
+    
     shadowCubesRef.current.forEach(cube => {
       cube.body.type = CANNON.Body.STATIC;
       cube.body.sleep();
@@ -988,7 +1030,7 @@ export const DiceGame: React.FC<Props> = ({ className }) => {
     if (!shadowWorldRef.current || !shadowRecordingRef.current.isRecording) return;
     
     const FAST_TIME_STEP = 1/60;
-    const STEPS_PER_FRAME = 10;
+    const STEPS_PER_FRAME = 6;
     const MAX_SIMULATION_FRAMES = 300;
     let frameCount = 0;
     let simulationTime = 0;
@@ -1030,8 +1072,22 @@ export const DiceGame: React.FC<Props> = ({ className }) => {
     requestAnimationFrame(fastSimulate);
   }, [recordShadowFrame, completeShadowRecording]);
 
-  // Execute shadow throw
-  const executeShadowThrow = useCallback((throwStrength: number): Promise<ShadowRecording> => {
+  // Apply saved state to shadow dice for perfect sync
+  const applySavedStateToShadowDice = useCallback((states: DiceState[]) => {
+    shadowCubesRef.current.forEach((cube, index) => {
+      if (index < states.length) {
+        const state = states[index];
+        cube.body.position.set(state.position.x, state.position.y, state.position.z);
+        cube.body.quaternion.set(state.quaternion.x, state.quaternion.y, state.quaternion.z, state.quaternion.w);
+        cube.body.velocity.set(state.velocity.x, state.velocity.y, state.velocity.z);
+        cube.body.angularVelocity.set(state.angularVelocity.x, state.angularVelocity.y, state.angularVelocity.z);
+        cube.body.wakeUp();
+      }
+    });
+  }, []);
+
+  // Execute shadow throw with optional initial state and streaming support
+  const executeShadowThrow = useCallback((throwStrength: number, initialState?: DiceState[]): Promise<ShadowRecording> => {
     return new Promise((resolve) => {
       console.log("EXECUTING SHADOW THROW with preset:", currentRiggingRef.current.preset, "strength:", throwStrength);
       
@@ -1041,19 +1097,21 @@ export const DiceGame: React.FC<Props> = ({ className }) => {
         return;
       }
 
-      shadowCubesRef.current.forEach((cube) => {
-        // Keep current position (which should be synced with main dice)
-        cube.body.type = CANNON.Body.DYNAMIC;
-        cube.body.velocity.set(0, 0, 0);
-        cube.body.angularVelocity.set(0, 0, 0);
-        cube.body.wakeUp();
-      });
+      // PERFECT SYNC: Use provided initial state or sync current state
+      if (initialState) {
+        console.log("Using provided initial state for perfect sync");
+        applySavedStateToShadowDice(initialState);
+      } else {
+        console.log("Using current main dice state for sync");
+        syncShadowDiceWithMain();
+      }
 
       shadowRecordingRef.current = {
         isRecording: true,
         frames: [],
         startTime: 0,
-        resolvePromise: resolve
+        resolvePromise: resolve,
+        streamingCallback: null // Will be set by streaming caller
       };
 
       setIsShadowDiceThrown(true);
@@ -1122,11 +1180,11 @@ export const DiceGame: React.FC<Props> = ({ className }) => {
         }
       });
 
-      console.log("Shadow throw forces applied, starting simulation");
+      console.log("Shadow throw forces applied, starting simulation with streaming");
       
       simulateShadowRollFast();
     });
-  }, [removeAllShadowConstraints, simulateShadowRollFast]);
+  }, [removeAllShadowConstraints, simulateShadowRollFast, applySavedStateToShadowDice, syncShadowDiceWithMain]);
 
   // Get the updated hook with accelerometer-based movement control
   const { 
@@ -1141,7 +1199,8 @@ export const DiceGame: React.FC<Props> = ({ className }) => {
     calibrate,
     isMovementEnabled,
     isFloatingMode,
-    initFloating
+    initFloating,
+    streamFrameToMainDice
   } = useAccelerometerDice(
     cubesRef, 
     isThrowingRef, 
@@ -1151,19 +1210,13 @@ export const DiceGame: React.FC<Props> = ({ className }) => {
     worldRef,
     removeAllConstraints,
     createDiceConstraints,
-    executeShadowThrow
+    (throwStrength: number, initialState?: DiceState[]) => {
+      // Set up streaming callback before starting shadow throw
+      shadowRecordingRef.current.streamingCallback = streamFrameToMainDice;
+      return executeShadowThrow(throwStrength, initialState);
+    }
   );
 
-  // Get device motion data using our new hook
-  const { 
-    motion, 
-    isShaking, 
-    accessGranted: motionAccessGranted, 
-    requestAccess: requestMotionAccess, 
-    revokeAccess: revokeMotionAccess 
-  } = useDeviceMotion({
-    shakeThreshold: 2.5
-  });
 
   useEffect(() => {
     isThrowingRef.current = isThrowing
@@ -1188,9 +1241,21 @@ export const DiceGame: React.FC<Props> = ({ className }) => {
     return () => clearTimeout(initTimer);
   }, [worldRef, cubesRef, initialPositionsRef, initFloating]);
 
-  // Modified effect: Set neutral position and handle initial setup
+  // Enhanced effect: Set neutral position and handle initial setup with better validation
   useEffect(() => {
-    if (motionAccessGranted && motion && !neutralPositionSetRef.current && !isThrowing && !isVisible) {
+    if (motionAccessGranted && motion && 
+        motion.accelerationIncludingGravity.x !== null && 
+        motion.accelerationIncludingGravity.y !== null && 
+        motion.accelerationIncludingGravity.z !== null && 
+        !neutralPositionSetRef.current && 
+        !isThrowing && !isVisible) {
+      
+      console.log("Valid motion data received, calibrating...", {
+        x: motion.accelerationIncludingGravity.x,
+        y: motion.accelerationIncludingGravity.y,
+        z: motion.accelerationIncludingGravity.z
+      });
+      
       calibrate(motion);
       neutralPositionSetRef.current = true;
       
@@ -1199,9 +1264,12 @@ export const DiceGame: React.FC<Props> = ({ className }) => {
       }
       
       if (!floatingInitializedRef.current) {
-        initFloating();
-        floatingInitializedRef.current = true;
-        setIsFloating(true);
+        setTimeout(() => {
+          initFloating();
+          floatingInitializedRef.current = true;
+          setIsFloating(true);
+          console.log("Floating animation initialized successfully");
+        }, 100);
       }
     }
   }, [motionAccessGranted, motion, calibrate, isThrowing, isVisible, createDiceConstraints, initFloating]);
@@ -1212,7 +1280,7 @@ export const DiceGame: React.FC<Props> = ({ className }) => {
       return;
     }
     
-    if (motionAccessGranted && isShaking) {
+    if (motionReady && isShaking) {
       console.log("Shake detected! Unlocking movement with floating mode.");
       setMovementUnlocked(true);
       setIsFloating(true);
@@ -1225,7 +1293,7 @@ export const DiceGame: React.FC<Props> = ({ className }) => {
         }
       }, 100);
     }
-  }, [motionAccessGranted, isShaking, movementUnlocked, enableMovement, isThrowing, isVisible, worldRef]);
+  }, [motionReady, isShaking, movementUnlocked, enableMovement, isThrowing, isVisible, worldRef]);
 
   // Update floating state based on dice controller state
   useEffect(() => {
@@ -1237,7 +1305,7 @@ export const DiceGame: React.FC<Props> = ({ className }) => {
 
   // Poll deadzone status frequently for UI updates
   useEffect(() => {
-    if (!isThrowing && !isVisible) {
+    if (!isThrowing && !isVisible && motionReady) {
       const updateStatus = () => {
         const status = getDeadzoneStatus();
         setDeadzoneState(status);
@@ -1261,7 +1329,7 @@ export const DiceGame: React.FC<Props> = ({ className }) => {
       const interval = setInterval(updateStatus, 30);
       return () => clearInterval(interval);
     }
-  }, [isThrowing, isVisible, getDeadzoneStatus, getAccelerometerDebugInfo, motion]);
+  }, [isThrowing, isVisible, motionReady, getDeadzoneStatus, getAccelerometerDebugInfo, motion]);
 
   // Process motion updates
   useEffect(() => {
@@ -1581,20 +1649,28 @@ export const DiceGame: React.FC<Props> = ({ className }) => {
 
   // Request access to device motion sensors
   const handleRequestAccess = async () => {
-    const result = await requestMotionAccess()
-    setAccessGranted(result)
+    console.log("Requesting motion access...");
     
-    if (result) {
-      neutralPositionSetRef.current = false;
-      setMovementUnlocked(false);
-      setIsFloating(true);
+    try {
+      const result = await requestMotionAccess()
+      console.log("Motion access result:", result);
       
-      if (!floatingInitializedRef.current) {
+      if (result) {
+        // Wait a bit for motion data to actually start flowing
+        console.log("Waiting for motion data to stabilize...");
+        
         setTimeout(() => {
-          initFloating();
-          floatingInitializedRef.current = true;
-        }, 100);
+          // Reset initialization flags to force re-initialization
+          neutralPositionSetRef.current = false;
+          floatingInitializedRef.current = false;
+          setMovementUnlocked(false);
+          setIsFloating(true);
+          
+          console.log("Motion access setup complete, waiting for motion data...");
+        }, 200);
       }
+    } catch (error) {
+      console.error("Failed to request motion access:", error);
     }
   }
 
@@ -1612,7 +1688,7 @@ export const DiceGame: React.FC<Props> = ({ className }) => {
     
     setTimeout(() => {
       resetDicePositions();
-      if(motion) calibrate(motion)
+      if(motionReady && motion) calibrate(motion)
       
       setTimeout(() => {
         createDiceConstraints();
@@ -1624,7 +1700,7 @@ export const DiceGame: React.FC<Props> = ({ className }) => {
         console.log("Roll cycle complete. Movement locked - waiting for shake.");
       }, rollScreenAnimationTimeRef.current);
     }, 50);
-  }, [resetDicePositions, createDiceConstraints, motion, calibrate, initFloating]);
+  }, [resetDicePositions, createDiceConstraints, motionReady, motion, calibrate, initFloating]);
 
   // Calculate total of dice values
   const diceTotal = useMemo(() => {
@@ -1645,7 +1721,7 @@ export const DiceGame: React.FC<Props> = ({ className }) => {
 
   // Function to recalibrate the accelerometer
   const handleRecalibrate = useCallback(() => {
-    if (motion) {
+    if (motionReady && motion) {
       calibrate(motion);
       setMovementUnlocked(false);
       setIsFloating(true);
@@ -1653,53 +1729,19 @@ export const DiceGame: React.FC<Props> = ({ className }) => {
       
       console.log("Recalibrated. Movement locked - waiting for shake.");
     }
-  }, [motion, calibrate, initFloating]);
+  }, [motionReady, motion, calibrate, initFloating]);
 
   return (
     <>
       <button
-        className="fixed top-[20px] left-1/2 -translate-x-1/2 w-[200px] h-10 z-[99] bg-blue-500 text-white rounded-md"
+        className={`fixed top-[20px] left-1/2 -translate-x-1/2 w-[200px] h-10 z-[99] text-white rounded-md transition-colors ${
+          motionReady ? 'bg-green-500' : motionAccessGranted ? 'bg-yellow-500' : 'bg-blue-500'
+        }`}
         onClick={handleRequestAccess}
       >
-        {motionAccessGranted ? "Access Granted" : "Enable Sensors"}
       </button>
 
-   
-        
-       
-
-
-      {/* On-screen dice results display */}
-      {rollResults.length > 0 && !isThrowing && (
-        <div className="fixed bottom-8 left-1/2 -translate-x-1/2 z-[100] flex flex-col items-center">
-          <div className="flex space-x-4 mb-2">
-            {rollResults.map((value, index) => (
-              <div 
-                key={index} 
-                className="w-15 h-14 bg-white rounded-lg flex items-center justify-center"
-                style={{
-                  border: '3px solid #333',
-                  boxShadow: '0 4px 8px rgba(0, 0, 0, 0.5)',
-                  position: 'relative'
-                }}
-              >
-                <span className="text-4xl font-extrabold" style={{ color: '#000' }}>
-                  {value}
-                </span>
-              </div>
-            ))}
-          </div>
-          
-          <div 
-            className="bg-black text-white py-2 px-6 rounded-full font-bold text-xl"
-            style={{ boxShadow: '0 2px 6px rgba(0, 0, 0, 0.3)' }}
-          >
-            Total: {diceTotal}
-          </div>
-        </div>
-      )}
-
-          <RollScreen 
+      <RollScreen 
         isVisible={isVisible} 
         result={rollResults} 
         onClose={handleCloseRollScreen} 
