@@ -1,5 +1,3 @@
-// use-accelerometer-dice.tsx
-
 "use client"
 
 import { useCallback, useEffect, useRef, useState } from "react"
@@ -9,10 +7,12 @@ import type { Cube } from "../game-board"
 import type { DeviceMotionData } from "./use-device-motion"
 
 // Constants for accelerometer-based movement
-const GRAVITY_STRENGTH = 700 // Used for tilt-based gravity adjustment
-const TILT_FORCE_MULTIPLIER = 7.5; // Multiplier for tilt-based force application
-const TILT_THRESHOLD = 0.25 // Threshold for tilt activation
-const DEAD_ZONE = 0.9 // Threshold for tilt to be considered active (acceleration diff)
+const GRAVITY_STRENGTH = 700
+const IMPULSE_MULTIPLIER = 150.0
+const TORQUE_MULTIPLIER = 0.2
+const TILT_THRESHOLD = 0.25
+const DEAD_ZONE = 0.9
+const THROW_THRESHOLD = 5.0
 
 // Constants for floating animation
 const FLOAT_BASE_HEIGHT = 3.0
@@ -25,26 +25,27 @@ const LINEAR_DAMPING = 0.2
 const ANGULAR_DAMPING = 0.9
 const FLOATING_LINEAR_DAMPING = 0.1
 const FLOATING_ANGULAR_DAMPING = 0.1
-const GROUND_LINEAR_DAMPING = 0.8 
-const GROUND_ANGULAR_DAMPING = 0.35 
-const GROUND_Z_DAMPING_MULTIPLIER = 0.8 
+const GROUND_LINEAR_DAMPING = 0.2
+const GROUND_ANGULAR_DAMPING = 0.35
+const GROUND_Z_DAMPING_MULTIPLIER = 0.8
 const VELOCITY_THRESHOLD = 0.8
 const ANGULAR_VELOCITY_THRESHOLD = 0.1
-const MAX_VELOCITY = 100 // Max linear velocity for dice
-const MAX_ANGULAR_VELOCITY = 5 // Max angular velocity for dice
-const DEADZONE_THROW_DELAY = 50 // Milliseconds to hold in deadzone before throw
+const STABLE_TIMEOUT = 100
+const MAX_VELOCITY = 100
+const MAX_ANGULAR_VELOCITY = 5
+const DEADZONE_THROW_DELAY = 50
 
-// Boundary parameters
-const Z_MIN_BOUNDARY = -15 // Minimum Z position for dice
-const Z_RESTORE_FORCE = 15 // Force to push dice back from Z boundary
+// Boundary parameters to keep dice in camera view
+const Z_MIN_BOUNDARY = -15
+const Z_RESTORE_FORCE = 15
 
-// Settle threshold
-const SETTLE_THRESHOLD = 0.15 // Speed below which a die is considered settling
+// Settle threshold for detecting when dice have stopped moving
+const SETTLE_THRESHOLD = 0.10
 
 // Throw constants
-const DEFAULT_THROW_FORCE_Y = 2.0      
-const DEFAULT_THROW_FORCE_Z = -32.0    
-const DEFAULT_THROW_STRENGTH = 1.5     
+const DEFAULT_THROW_FORCE_Y = 2.0
+const DEFAULT_THROW_FORCE_Z = -32.0
+const DEFAULT_THROW_STRENGTH = 1.5
 
 interface DeadzoneStatus {
   inDeadzone: boolean
@@ -69,20 +70,30 @@ interface AccelerometerDebugInfo {
     y: string
     z: string
   }
-  acceleration: number // Magnitude of filtered acceleration
-  tiltX: number // Processed tilt around X-axis
-  tiltY: number // Processed tilt around Y-axis
+  acceleration: number
+  tiltX: number
+  tiltY: number
 }
 
 interface FloatingAnimState {
   timeAccumulator: number
-  basePositions: CANNON.Vec3[] // Store base X,Z for floating, Y is calculated
+  basePositions: CANNON.Vec3[]
   isActive: boolean
 }
 
-// Shadow recording interface
+// Shadow recording interfaces
+interface PhysicsFrame {
+  timestamp: number
+  diceStates: {
+    position: { x: number, y: number, z: number }
+    quaternion: { x: number, y: number, z: number, w: number }
+    velocity: { x: number, y: number, z: number }
+    angularVelocity: { x: number, y: number, z: number }
+  }[]
+}
+
 interface ShadowRecording {
-  frames: any[] // Consider a more specific type for frames if possible
+  frames: PhysicsFrame[]
   finalResults: number[]
   isComplete: boolean
   isRigged?: boolean
@@ -98,38 +109,40 @@ export const useAccelerometerDice = (
   worldRef: React.MutableRefObject<CANNON.World | null>,
   removeAllConstraints: () => void,
   createDiceConstraints: () => void,
-  onShadowThrowNeeded: (throwStrength: number) => Promise<ShadowRecording>,
-  initialPositionsRef: React.MutableRefObject<CANNON.Vec3[]>
+  onShadowThrowNeeded: (throwStrength: number) => Promise<ShadowRecording>
 ) => {
   const [inDeadzone, setInDeadzone] = useState(false)
   const [deadzoneTimer, setDeadzoneTimer] = useState<number | null>(null)
   const [deadzoneProgress, setDeadzoneProgress] = useState(0)
-  const [hasMoved, setHasMoved] = useState(false) // Tracks if user has made an initial tilt movement
+  const [hasMoved, setHasMoved] = useState(false)
   
   const lastMotion = useRef<DeviceMotionData | null>(null)
   const filteredAcceleration = useRef<{ x: number; y: number; z: number }>({ x: 0, y: 0, z: 0 })
-  const isMovingEnabled = useRef<boolean>(false) // Controlled by enableMovement/disableMovement
-  const floatingModeRef = useRef<boolean>(true) // Tracks if dice are in floating state
+  const throwVelocity = useRef<CANNON.Vec3>(new CANNON.Vec3())
+  const isReleased = useRef(false)
+  const isMovingEnabled = useRef<boolean>(false)
+  const floatingModeRef = useRef<boolean>(true)
   const floatingAnimState = useRef<FloatingAnimState>({
     timeAccumulator: 0,
     basePositions: [],
     isActive: false
   })
   
-  const diceHitGroundRef = useRef<boolean>(false) // Tracks if dice hit ground during a throw
-  const groundHitTimeRef = useRef<number | null>(null) // Timestamp of ground hit
-  const MIN_GROUND_SETTLE_TIME = 300 // ms, min time after ground hit before checking settle
+  const diceHitGroundRef = useRef<boolean>(false)
+  const groundHitTimeRef = useRef<number | null>(null)
+  const MIN_GROUND_SETTLE_TIME = 300
   
-  const neutralAccelRef = useRef<{ x: number; y: number; z: number } | null>(null) // Stores calibrated neutral acceleration
+  const neutralAccelRef = useRef<{ x: number; y: number; z: number } | null>(null)
   
-  const animationFrameId = useRef<number | null>(null) // For deadzone progress updates
-  const pulsationAnimationId = useRef<number | null>(null) // For floating animation
+  const animationFrameId = useRef<number | null>(null)
+  const pulsationAnimationId = useRef<number | null>(null)
 
+  // Playback state for recorded shadow throws
   const playbackStateRef = useRef<{
     isPlayingBack: boolean
     recording: ShadowRecording | null
     startTime: number
-    currentFrameIndex: number // Not strictly needed with timestamp-based playback
+    currentFrameIndex: number
     isRigged: boolean
     riggedResults: number[]
   }>({
@@ -141,60 +154,43 @@ export const useAccelerometerDice = (
     riggedResults: []
   })
 
-  // Pre-throw animation state
-  const preThrowAnimationRef = useRef<{
-    isAnimating: boolean
-    startTime: number
-    startPositions: CANNON.Vec3[]
-    targetPositions: CANNON.Vec3[]
-    pendingThrowStrength: number
-    animationFrameId: number | null
-  }>({
-    isAnimating: false,
-    startTime: 0,
-    startPositions: [],
-    targetPositions: [],
-    pendingThrowStrength: DEFAULT_THROW_STRENGTH,
-    animationFrameId: null
-  })
-
   const updateDeadzoneState = useCallback(() => {
-    if (!inDeadzone || deadzoneTimer === null) { 
-      if (animationFrameId.current) cancelAnimationFrame(animationFrameId.current);
-      animationFrameId.current = null;
-      return;
-    }
+    if (!inDeadzone || deadzoneTimer === null) return;
     
     const now = Date.now();
     const elapsed = now - deadzoneTimer;
-    const newProgress = Math.min(100, (elapsed / DEADZONE_THROW_DELAY) * 100);
-    setDeadzoneProgress(newProgress);
+    const newProgress = (elapsed / DEADZONE_THROW_DELAY) * 100;
+    
+    setDeadzoneProgress(Math.min(100, newProgress));
     
     if (elapsed >= DEADZONE_THROW_DELAY) {
-      console.log("DEADZONE TIMER COMPLETE - INITIATING SHADOW-FIRST THROW");
+      console.log("DEADZONE TIMER COMPLETE - THROWING");
       
-      setInDeadzone(false); 
+      setInDeadzone(false);
       setDeadzoneTimer(null);
       setDeadzoneProgress(0);
       
       floatingModeRef.current = false;
       stopFloatingAnimation();
-      diceHitGroundRef.current = false; 
+      diceHitGroundRef.current = false;
       groundHitTimeRef.current = null;
       
-      startShadowFirstThrow(DEFAULT_THROW_STRENGTH); 
-    } else {
-      animationFrameId.current = requestAnimationFrame(updateDeadzoneState);
+      // Start shadow throw and playback instead of direct physics
+      startThrow(DEFAULT_THROW_STRENGTH);
     }
-  }, [inDeadzone, deadzoneTimer]); 
+    
+    animationFrameId.current = requestAnimationFrame(updateDeadzoneState);
+  }, [inDeadzone, deadzoneTimer]);
 
   const storeBasePositions = useCallback(() => {
     const positions: CANNON.Vec3[] = []
+    
     cubesRef.current.forEach((cube) => {
       if (cube.body) {
-        positions.push(new CANNON.Vec3(cube.body.position.x, FLOAT_BASE_HEIGHT, cube.body.position.z));
+        positions.push(cube.body.position.clone())
       }
     })
+    
     floatingAnimState.current.basePositions = positions
   }, [cubesRef])
 
@@ -206,113 +202,9 @@ export const useAccelerometerDice = (
     floatingAnimState.current.isActive = false
   }, [])
 
-  const stopPreThrowAnimation = useCallback(() => {
-    if (preThrowAnimationRef.current.animationFrameId !== null) {
-      cancelAnimationFrame(preThrowAnimationRef.current.animationFrameId)
-      preThrowAnimationRef.current.animationFrameId = null
-    }
-    preThrowAnimationRef.current.isAnimating = false
-  }, [])
-
-  const animateToStartingPositions = useCallback(() => {
-    if (!preThrowAnimationRef.current.isAnimating) return
-
-    const currentTime = Date.now()
-    const elapsed = currentTime - preThrowAnimationRef.current.startTime
-    const duration = 200 // 600ms animation duration
-    const progress = Math.min(elapsed / duration, 1)
-
-    // Use easeOutCubic for smooth deceleration
-    const easeProgress = 1 - Math.pow(1 - progress, 3)
-
-    cubesRef.current.forEach((cube, index) => {
-      if (index < preThrowAnimationRef.current.startPositions.length && 
-          index < preThrowAnimationRef.current.targetPositions.length && cube.body) {
-        
-        const startPos = preThrowAnimationRef.current.startPositions[index]
-        const targetPos = preThrowAnimationRef.current.targetPositions[index]
-
-        // Interpolate position
-        const currentX = startPos.x + (targetPos.x - startPos.x) * easeProgress
-        const currentY = startPos.y + (targetPos.y - startPos.y) * easeProgress
-        const currentZ = startPos.z + (targetPos.z - startPos.z) * easeProgress
-
-        cube.body.position.set(currentX, currentY, currentZ)
-        
-        // Reduce velocities during animation for smoother movement
-        cube.body.velocity.scale(0.9, cube.body.velocity)
-        cube.body.angularVelocity.scale(0.9, cube.body.angularVelocity)
-        
-        cube.body.wakeUp()
-      }
-    })
-
-    if (progress >= 1) {
-      console.log("Pre-throw animation complete, starting actual throw")
-      stopPreThrowAnimation()
-      
-      // Now start the actual throw with the pending strength
-      executeActualThrow(preThrowAnimationRef.current.pendingThrowStrength)
-    } else {
-      // Continue animation
-      preThrowAnimationRef.current.animationFrameId = requestAnimationFrame(animateToStartingPositions)
-    }
-  }, [cubesRef])
-
-  const startPreThrowAnimation = useCallback((throwStrength: number) => {
-    console.log("Starting pre-throw animation to move dice to starting positions")
-    
-    // Store current positions as start positions
-    const startPositions: CANNON.Vec3[] = []
-    const targetPositions: CANNON.Vec3[] = []
-    
-    cubesRef.current.forEach((cube, index) => {
-      startPositions.push(cube.body.position.clone())
-      
-      // Target positions are the initial spawn positions (centered formation)
-      if (index < initialPositionsRef.current.length) {
-        const targetPos = initialPositionsRef.current[index].clone()
-        targetPos.y = FLOAT_BASE_HEIGHT // Keep them at floating height
-        targetPositions.push(targetPos)
-      } else {
-        targetPositions.push(cube.body.position.clone()) // Fallback
-      }
-    })
-
-    preThrowAnimationRef.current = {
-      isAnimating: true,
-      startTime: Date.now(),
-      startPositions,
-      targetPositions,
-      pendingThrowStrength: throwStrength,
-      animationFrameId: null
-    }
-
-    // Disable floating animation and movement during pre-throw
-    stopFloatingAnimation()
-    floatingModeRef.current = false
-    
-    // Remove constraints to allow smooth movement
-    removeAllConstraints()
-    
-    // Set appropriate physics for smooth animation
-    if (worldRef.current) {
-      worldRef.current.gravity.set(0, -5, 0) // Light gravity during animation
-    }
-    
-    cubesRef.current.forEach(cube => {
-      cube.body.type = CANNON.Body.DYNAMIC
-      cube.body.linearDamping = 0.8 // High damping for smooth movement
-      cube.body.angularDamping = 0.8
-      cube.body.wakeUp()
-    })
-
-    // Start the animation
-    preThrowAnimationRef.current.animationFrameId = requestAnimationFrame(animateToStartingPositions)
-  }, [cubesRef, initialPositionsRef, stopFloatingAnimation, removeAllConstraints, worldRef, animateToStartingPositions])
-
- const interpolateFrame = useCallback((frame1: any, frame2: any, t: number): any => {
-    const interpolatedStates = frame1.diceStates.map((state1: any, index: number) => {
+  // Interpolate between two recorded frames for smooth playback
+  const interpolateFrame = useCallback((frame1: PhysicsFrame, frame2: PhysicsFrame, t: number): PhysicsFrame => {
+    const interpolatedStates = frame1.diceStates.map((state1, index) => {
       const state2 = frame2.diceStates[index]
       
       const position = {
@@ -323,7 +215,7 @@ export const useAccelerometerDice = (
       
       const q1 = new THREE.Quaternion(state1.quaternion.x, state1.quaternion.y, state1.quaternion.z, state1.quaternion.w)
       const q2 = new THREE.Quaternion(state2.quaternion.x, state2.quaternion.y, state2.quaternion.z, state2.quaternion.w)
-      const interpolatedQuaternion = q1.slerp(q2, t) 
+      const interpolatedQuaternion = q1.slerp(q2, t)
       
       const velocity = {
         x: state1.velocity.x + (state2.velocity.x - state1.velocity.x) * t,
@@ -351,7 +243,8 @@ export const useAccelerometerDice = (
     }
   }, [])
 
- const applyRecordedFrame = useCallback((frame: any) => {
+  // Apply a recorded frame to the actual dice
+  const applyRecordedFrame = useCallback((frame: PhysicsFrame) => {
     const playback = playbackStateRef.current;
     
     cubesRef.current.forEach((cube, index) => {
@@ -364,7 +257,7 @@ export const useAccelerometerDice = (
         cube.body.velocity.set(state.velocity.x, state.velocity.y, state.velocity.z)
         cube.body.angularVelocity.set(state.angularVelocity.x, state.angularVelocity.y, state.angularVelocity.z)
         
-        cube.body.wakeUp() 
+        cube.body.wakeUp()
       }
     })
     
@@ -373,12 +266,13 @@ export const useAccelerometerDice = (
     }
   }, [cubesRef])
 
-const updatePlayback = useCallback(() => {
+  // Update playback of recorded shadow throw
+  const updatePlayback = useCallback(() => {
     const playback = playbackStateRef.current
     if (!playback.isPlayingBack || !playback.recording || playback.recording.frames.length === 0) return
 
     const currentTime = Date.now()
-    const elapsedTime = currentTime - playback.startTime 
+    const elapsedTime = currentTime - playback.startTime
     
     let currentFrameIndex = -1
     let nextFrameIndex = -1
@@ -401,15 +295,15 @@ const updatePlayback = useCallback(() => {
       
       const interpolatedFrame = interpolateFrame(frame1, frame2, Math.max(0, Math.min(1, t)))
       applyRecordedFrame(interpolatedFrame)
-    } else { 
+    } else {
       const lastFrame = playback.recording.frames[playback.recording.frames.length - 1]
-      if (elapsedTime >= lastFrame.timestamp) { 
-        applyRecordedFrame(lastFrame) 
+      if (elapsedTime >= lastFrame.timestamp) {
+        applyRecordedFrame(lastFrame)
         
-        if (elapsedTime >= lastFrame.timestamp + 100) { 
-          console.log("ENHANCED PLAYBACK COMPLETE - FINALIZING RESULTS");
+        if (elapsedTime >= lastFrame.timestamp + 100) {
+          console.log("PLAYBACK COMPLETE - FINALIZING RESULTS");
           
-          cubesRef.current.forEach(cube => { 
+          cubesRef.current.forEach(cube => {
             cube.body.type = CANNON.Body.STATIC
             cube.body.velocity.set(0, 0, 0)
             cube.body.angularVelocity.set(0, 0, 0)
@@ -421,7 +315,7 @@ const updatePlayback = useCallback(() => {
             
           console.log("Finalizing results:", finalResults, playback.isRigged ? "(RIGGED)" : "(NATURAL)");
           
-          setTimeout(() => { 
+          setTimeout(() => {
             setRollResults(finalResults)
             setIsThrowing(false)
             isThrowingRef.current = false
@@ -429,162 +323,57 @@ const updatePlayback = useCallback(() => {
             playback.recording = null
             playback.isRigged = false
             playback.riggedResults = []
-            floatingModeRef.current = false 
+            floatingModeRef.current = false
             stopFloatingAnimation()
-          }, 50) 
+          }, 50)
           
-          return 
+          return
         }
-      } else { 
+      } else {
         applyRecordedFrame(playback.recording.frames[0])
       }
     }
     
-    requestAnimationFrame(updatePlayback) 
+    requestAnimationFrame(updatePlayback)
   }, [applyRecordedFrame, interpolateFrame, setRollResults, setIsThrowing, stopFloatingAnimation, isThrowingRef, cubesRef])
 
-  const executeActualThrow = useCallback(async (throwStrength: number) => {
-    console.log("EXECUTING ACTUAL THROW after pre-animation, strength:", throwStrength)
-    
-    if (isThrowingRef.current) return
-    
-    isThrowingRef.current = true
-    setIsThrowing(true)
-    diceHitGroundRef.current = false
-    groundHitTimeRef.current = null
-
-    try {
-      console.log("Requesting shadow roll recording from main game component...")
-      const shadowRecording = await onShadowThrowNeeded(throwStrength)
-      
-      console.log("Shadow roll recording received. Frames:", shadowRecording.frames.length, 
-                  "Rigged:", shadowRecording.isRigged, "Desired:", shadowRecording.desiredResults)
-      
-      if (worldRef.current) { 
-        worldRef.current.gravity.set(0, -50, 0)
-      }
-      
-      cubesRef.current.forEach(cube => { 
-        cube.body.type = CANNON.Body.DYNAMIC
-        cube.body.linearDamping = 0.05
-        cube.body.angularDamping = 0.05
-        cube.body.wakeUp()
-      })
-      
-      playbackStateRef.current = {
-        isPlayingBack: true,
-        recording: shadowRecording,
-        startTime: Date.now(),
-        currentFrameIndex: 0, 
-        isRigged: shadowRecording.isRigged || false,
-        riggedResults: (shadowRecording.isRigged && shadowRecording.desiredResults) ? shadowRecording.desiredResults : shadowRecording.finalResults
-      }
-      
-      requestAnimationFrame(updatePlayback)
-      
-    } catch (error) {
-      console.error("Shadow roll failed or was rejected, falling back to direct throw:", error)
-      startDirectThrowImmediate(throwStrength)
-    }
-  }, [cubesRef, isThrowingRef, setIsThrowing, worldRef, onShadowThrowNeeded, updatePlayback])
-
-  const startDirectThrowImmediate = useCallback((throwStrength = DEFAULT_THROW_STRENGTH) => {
-    console.log("DIRECT THROW (immediate, after pre-animation) initiated, strength:", throwStrength)
-    
-    if (worldRef.current) worldRef.current.gravity.set(0, -50, 0)
-    
-    const baseThrowVelocity = new CANNON.Vec3(
-      0, 
-      DEFAULT_THROW_FORCE_Y * throwStrength, 
-      DEFAULT_THROW_FORCE_Z * throwStrength
-    )
-    
-    cubesRef.current.forEach((cube, index) => {
-      cube.body.type = CANNON.Body.DYNAMIC
-      cube.body.wakeUp()
-      
-      // Add random initial rotation to each die before throwing
-      const randomInitialRotation = new CANNON.Quaternion()
-      randomInitialRotation.setFromAxisAngle(
-        new CANNON.Vec3(
-          Math.random() - 0.5,
-          Math.random() - 0.5, 
-          Math.random() - 0.5
-        ).unit(),
-        Math.random() * Math.PI * 2
-      )
-      cube.body.quaternion = cube.body.quaternion.mult(randomInitialRotation)
-      
-      const variationScale = 0.3 * throwStrength
-      const vx = baseThrowVelocity.x + (Math.random() - 0.5) * variationScale * 2
-      const vy = baseThrowVelocity.y + (Math.random() - 0.5) * variationScale
-      const vz = baseThrowVelocity.z + (Math.random() - 0.5) * variationScale * 3
-      
-      cube.body.velocity.set(vx, vy, vz)
-      
-      // Enhanced random angular velocity with more variation per die
-      const baseAngularStrength = (4 + Math.random() * 4) * throwStrength
-      const angularX = (Math.random() - 0.5) * baseAngularStrength * (0.5 + Math.random() * 1.5)
-      const angularY = (Math.random() - 0.5) * baseAngularStrength * (0.5 + Math.random() * 1.5)
-      const angularZ = (Math.random() - 0.5) * baseAngularStrength * (0.5 + Math.random() * 1.5)
-      
-      const biasX = Math.sin(index * 1.2) * 2 * throwStrength
-      const biasY = Math.cos(index * 0.8) * 2 * throwStrength
-      const biasZ = Math.sin(index * 1.5) * 2 * throwStrength
-      
-      cube.body.angularVelocity.set(
-        angularX + biasX,
-        angularY + biasY,
-        angularZ + biasZ
-      )
-      
-      if (Math.random() < 0.3) {
-        const spinBoost = 3 + Math.random() * 4
-        const spinAxis = Math.floor(Math.random() * 3)
-        if (spinAxis === 0) cube.body.angularVelocity.x += (Math.random() - 0.5) * spinBoost
-        else if (spinAxis === 1) cube.body.angularVelocity.y += (Math.random() - 0.5) * spinBoost
-        else cube.body.angularVelocity.z += (Math.random() - 0.5) * spinBoost
-      }
-      
-      cube.body.linearDamping = 0.05
-      cube.body.angularDamping = 0.05
-    })
-    
-    setHasMoved(false)
-  }, [cubesRef, worldRef, setHasMoved])
-
   const applyPulsatingAnimation = useCallback(() => {
-    if (!floatingModeRef.current || isThrowingRef.current || !floatingAnimState.current.isActive) {
-      stopFloatingAnimation() 
+    if (!floatingModeRef.current || isThrowingRef.current) {
+      stopFloatingAnimation()
       return
     }
     
-    floatingAnimState.current.timeAccumulator += 0.016 
+    floatingAnimState.current.timeAccumulator += 0.016
     const totalTime = floatingAnimState.current.timeAccumulator
     
-    const pulsation = Math.sin(totalTime * FLOAT_FREQUENCY) * FLOAT_AMPLITUDE 
+    const pulsation = Math.sin(totalTime * FLOAT_FREQUENCY) * FLOAT_AMPLITUDE
     
     cubesRef.current.forEach((cube, index) => {
       if (!cube.body) return
       
-      let basePos: CANNON.Vec3 = (index < floatingAnimState.current.basePositions.length)
-                               ? floatingAnimState.current.basePositions[index]
-                               : new CANNON.Vec3(cube.body.position.x, FLOAT_BASE_HEIGHT, cube.body.position.z); 
+      let basePos: CANNON.Vec3
+      
+      if (index < floatingAnimState.current.basePositions.length) {
+        basePos = floatingAnimState.current.basePositions[index]
+      } else {
+        basePos = cube.body.position.clone()
+        floatingAnimState.current.basePositions.push(basePos)
+      }
       
       const targetY = FLOAT_BASE_HEIGHT + pulsation
       const yDiff = targetY - cube.body.position.y
-      const xDiff = basePos.x - cube.body.position.x 
+      const xDiff = basePos.x - cube.body.position.x
       const zDiff = basePos.z - cube.body.position.z
       
-      const yForce = yDiff * 12 
-      const xForce = xDiff * 4  
-      const zForce = zDiff * 4  
+      const yForce = yDiff * 12
+      const xForce = xDiff * 4
+      const zForce = zDiff * 4
       
       cube.body.applyForce(new CANNON.Vec3(xForce, yForce, zForce), cube.body.position)
       
-      const rotX = Math.sin(totalTime * 1.1 + index * 0.5) * FLOAT_ROTATION_SPEED 
-      const rotY = Math.cos(totalTime * 0.7 + index * 0.5) * FLOAT_ROTATION_SPEED
-      const rotZ = Math.sin(totalTime * 0.9 + index * 0.5) * FLOAT_ROTATION_SPEED
+      const rotX = Math.sin(totalTime * 1.1) * FLOAT_ROTATION_SPEED
+      const rotY = Math.cos(totalTime * 0.7) * FLOAT_ROTATION_SPEED
+      const rotZ = Math.sin(totalTime * 0.9) * FLOAT_ROTATION_SPEED
       
       cube.body.angularVelocity.set(rotX, rotY, rotZ)
       cube.body.linearDamping = FLOATING_LINEAR_DAMPING
@@ -596,397 +385,538 @@ const updatePlayback = useCallback(() => {
   }, [cubesRef, stopFloatingAnimation, isThrowingRef])
 
   const startFloatingAnimation = useCallback(() => {
-    if (floatingAnimState.current.isActive || !floatingModeRef.current) return
+    if (floatingAnimState.current.isActive) return
     
-    console.log("Starting floating animation (Main Game - useAccelerometerDice)");
+    console.log("Starting floating animation")
+    
     floatingAnimState.current.timeAccumulator = 0
-    storeBasePositions() 
+    storeBasePositions()
     floatingAnimState.current.isActive = true
     
-    if (pulsationAnimationId.current !== null) cancelAnimationFrame(pulsationAnimationId.current);
-    pulsationAnimationId.current = requestAnimationFrame(applyPulsatingAnimation);
+    if (pulsationAnimationId.current !== null) {
+      cancelAnimationFrame(pulsationAnimationId.current)
+    }
+    pulsationAnimationId.current = requestAnimationFrame(applyPulsatingAnimation)
     
     if (worldRef.current) {
-      worldRef.current.gravity.set(0, -1, 0); 
+      worldRef.current.gravity.set(0, -1, 0)
     }
   }, [applyPulsatingAnimation, storeBasePositions, worldRef])
 
   useEffect(() => {
     if (inDeadzone && deadzoneTimer !== null) {
-      if (animationFrameId.current) cancelAnimationFrame(animationFrameId.current); 
-      animationFrameId.current = requestAnimationFrame(updateDeadzoneState);
-    } else {
-      if (animationFrameId.current) {
-        cancelAnimationFrame(animationFrameId.current);
-        animationFrameId.current = null;
+      animationFrameId.current = requestAnimationFrame(updateDeadzoneState)
+    } else if (animationFrameId.current !== null) {
+      cancelAnimationFrame(animationFrameId.current)
+      animationFrameId.current = null
+    }
+    
+    return () => {
+      if (animationFrameId.current !== null) {
+        cancelAnimationFrame(animationFrameId.current)
+        animationFrameId.current = null
       }
     }
-    return () => { 
-      if (animationFrameId.current) cancelAnimationFrame(animationFrameId.current);
-    };
-  }, [inDeadzone, deadzoneTimer, updateDeadzoneState]);
+  }, [inDeadzone, deadzoneTimer, updateDeadzoneState])
 
   useEffect(() => {
-    return () => { 
-      if (pulsationAnimationId.current !== null) cancelAnimationFrame(pulsationAnimationId.current);
-      if (animationFrameId.current !== null) cancelAnimationFrame(animationFrameId.current);
-      if (preThrowAnimationRef.current.animationFrameId !== null) cancelAnimationFrame(preThrowAnimationRef.current.animationFrameId);
-    };
-  }, []);
+    return () => {
+      if (pulsationAnimationId.current !== null) {
+        cancelAnimationFrame(pulsationAnimationId.current)
+        pulsationAnimationId.current = null
+      }
+      if (animationFrameId.current !== null) {
+        cancelAnimationFrame(animationFrameId.current)
+        animationFrameId.current = null
+      }
+    }
+  }, [])
 
   const getDiceValue = useCallback((cube: Cube): number => {
-    if (!cube || !cube.body) return 1; 
     const worldUp = new THREE.Vector3(0, 1, 0)
-    const faceNormals = [ 
-      new THREE.Vector3(1, 0, 0), new THREE.Vector3(-1, 0, 0), 
-      new THREE.Vector3(0, 1, 0), new THREE.Vector3(0, -1, 0), 
-      new THREE.Vector3(0, 0, 1), new THREE.Vector3(0, 0, -1), 
+    const faceNormals = [
+      new THREE.Vector3(1, 0, 0),   // Right (+X) - face 1
+      new THREE.Vector3(-1, 0, 0),  // Left (-X) - face 6
+      new THREE.Vector3(0, 1, 0),   // Top (+Y) - face 2
+      new THREE.Vector3(0, -1, 0),  // Bottom (-Y) - face 5
+      new THREE.Vector3(0, 0, 1),   // Front (+Z) - face 3
+      new THREE.Vector3(0, 0, -1),  // Back (-Z) - face 4
     ]
-    const faceValues = [1, 6, 2, 5, 3, 4] 
-    const rotation = new THREE.Quaternion().copy(cube.body.quaternion as unknown as THREE.Quaternion)
-    let maxAlignment = -Infinity, topFaceIndex = 0
+    const faceValues = [1, 6, 2, 5, 3, 4]
+    
+    const rotation = new THREE.Quaternion(
+      cube.body.quaternion.x,
+      cube.body.quaternion.y,
+      cube.body.quaternion.z,
+      cube.body.quaternion.w
+    )
+    
+    let maxAlignment = -Infinity
+    let topFaceIndex = 0
+    
     faceNormals.forEach((normal, index) => {
-      const worldNormal = normal.clone().applyQuaternion(rotation) 
-      const alignment = worldNormal.dot(worldUp) 
+      const rotatedNormal = normal.clone()
+      rotatedNormal.applyQuaternion(rotation)
+      const alignment = rotatedNormal.dot(worldUp)
+      
       if (alignment > maxAlignment) {
         maxAlignment = alignment
         topFaceIndex = index
       }
     })
+    
     return faceValues[topFaceIndex]
   }, [])
 
   const processAcceleration = useCallback((motion: DeviceMotionData) => {
-    if (!motion.accelerationIncludingGravity.x || !motion.accelerationIncludingGravity.y || !motion.accelerationIncludingGravity.z) {
-      return filteredAcceleration.current; 
+    if (!motion.accelerationIncludingGravity.x || 
+        !motion.accelerationIncludingGravity.y || 
+        !motion.accelerationIncludingGravity.z) {
+      return filteredAcceleration.current
     }
-    const alpha = 0.8; 
+    
+    const alpha = 0.8
+    
     filteredAcceleration.current = {
       x: filteredAcceleration.current.x * alpha + motion.accelerationIncludingGravity.x * (1 - alpha),
       y: filteredAcceleration.current.y * alpha + motion.accelerationIncludingGravity.y * (1 - alpha),
       z: filteredAcceleration.current.z * alpha + motion.accelerationIncludingGravity.z * (1 - alpha)
-    };
-    return filteredAcceleration.current;
+    }
+    
+    return filteredAcceleration.current
   }, [])
 
-  const startShadowFirstThrow = useCallback(async (throwStrength = DEFAULT_THROW_STRENGTH) => {
-    console.log("STARTING SHADOW-FIRST THROW with pre-animation, strength:", throwStrength)
-    if (isThrowingRef.current || preThrowAnimationRef.current.isAnimating) return
-    
-    // Check if dice are already near starting positions
-    const needsPreAnimation = cubesRef.current.some((cube, index) => {
-      if (index >= initialPositionsRef.current.length) return false
-      const targetPos = initialPositionsRef.current[index]
-      const currentPos = cube.body.position
-      const distance = Math.sqrt(
-        Math.pow(currentPos.x - targetPos.x, 2) + 
-        Math.pow(currentPos.z - targetPos.z, 2)
-      )
-      return distance > 1.0 // If more than 1 unit away, needs animation
-    })
-
-    if (needsPreAnimation) {
-      console.log("Dice are away from center, starting pre-throw animation")
-      startPreThrowAnimation(throwStrength)
-    } else {
-      console.log("Dice are already centered, starting throw immediately")
-      executeActualThrow(throwStrength)
-    }
-  }, [cubesRef, initialPositionsRef, isThrowingRef, startPreThrowAnimation, executeActualThrow])
-
-  const checkForGroundHit = useCallback(() => {
-    if (!isThrowingRef.current || diceHitGroundRef.current || cubesRef.current.length === 0 || playbackStateRef.current.isPlayingBack) return;
-    
-    const groundHit = cubesRef.current.some(cube => cube.body.position.y < 1.0); 
-    
-    if (groundHit && !diceHitGroundRef.current) {
-      console.log("DICE HIT GROUND (Direct Throw) - Applying ground damping");
-      diceHitGroundRef.current = true;
-      groundHitTimeRef.current = Date.now();
-      
-      cubesRef.current.forEach(cube => {
-        cube.body.linearDamping = GROUND_LINEAR_DAMPING;
-        cube.body.angularDamping = GROUND_ANGULAR_DAMPING;
-        if (cube.body.velocity.z < 0) { 
-          cube.body.velocity.z *= (1 - GROUND_Z_DAMPING_MULTIPLIER * 0.05); 
-        }
-      });
-    }
-    
-    if (diceHitGroundRef.current) {
-      cubesRef.current.forEach(cube => {
-        if (cube.body.position.z < Z_MIN_BOUNDARY) {
-          const zForceMagnitude = (Z_MIN_BOUNDARY - cube.body.position.z) * Z_RESTORE_FORCE;
-          cube.body.applyForce(new CANNON.Vec3(0, 0, zForceMagnitude), cube.body.position);
-          cube.body.velocity.z *= 0.5; 
-        }
-      });
-    }
-  }, [cubesRef, isThrowingRef]); 
-
-  const checkIfDiceSettled = useCallback(() => {
-    if (!isThrowingRef.current || cubesRef.current.length === 0 || playbackStateRef.current.isPlayingBack) return;
-    
-    checkForGroundHit(); 
-    
-    if (!diceHitGroundRef.current || !groundHitTimeRef.current || (Date.now() - groundHitTimeRef.current < MIN_GROUND_SETTLE_TIME)) {
-      return;
-    }
-
-    const allSettled = cubesRef.current.every(cube => {
-      const linearSpeed = cube.body.velocity.length();
-      const angularSpeed = cube.body.angularVelocity.length();
-      return linearSpeed < SETTLE_THRESHOLD && angularSpeed < SETTLE_THRESHOLD && cube.body.sleepState === CANNON.Body.SLEEPING;
-    });
-
-    if (allSettled) {
-      console.log("MAIN DICE SETTLED (Direct Throw)");
-      removeAllConstraints(); 
-
-      cubesRef.current.forEach(cube => { 
-        cube.body.type = CANNON.Body.STATIC;
-        cube.body.velocity.set(0,0,0);
-        cube.body.angularVelocity.set(0,0,0);
-        cube.mesh.position.copy(cube.body.position as unknown as THREE.Vector3);
-        cube.mesh.quaternion.copy(cube.body.quaternion as unknown as THREE.Quaternion);
-      });
-      
-      if (worldRef.current) worldRef.current.gravity.set(0, 0, 0); 
-      
-      const results = cubesRef.current.map(getDiceValue);
-      
-      setTimeout(() => { 
-        setRollResults(results);
-        setIsThrowing(false);
-        isThrowingRef.current = false;
-        floatingModeRef.current = false; 
-        stopFloatingAnimation();
-      }, 50);
-    }
-  }, [cubesRef, getDiceValue, isThrowingRef, setIsThrowing, setRollResults, checkForGroundHit, removeAllConstraints, stopFloatingAnimation, worldRef]);
-  
-  const applyCohesiveMovement = useCallback(() => {
-    if (cubesRef.current.length === 0) return;
-    cubesRef.current.forEach(cube => {
-      if (floatingModeRef.current) {
-        cube.body.linearDamping = FLOATING_LINEAR_DAMPING;
-        cube.body.angularDamping = FLOATING_ANGULAR_DAMPING;
-      } else { 
-        cube.body.linearDamping = LINEAR_DAMPING;
-        cube.body.angularDamping = ANGULAR_DAMPING;
-      }
-      cube.body.wakeUp();
-    });
-  }, [cubesRef]);
-
-  const clampDiceVelocities = useCallback(() => {
-    cubesRef.current.forEach((cube) => {
-      const linearVel = cube.body.velocity;
-      if (linearVel.length() > MAX_VELOCITY) linearVel.scale(MAX_VELOCITY / linearVel.length(), linearVel);
-      const angularVel = cube.body.angularVelocity;
-      if (angularVel.length() > MAX_ANGULAR_VELOCITY) angularVel.scale(MAX_ANGULAR_VELOCITY / angularVel.length(), angularVel);
-    });
-  }, [cubesRef]);
-
   const calibrate = useCallback((motion: DeviceMotionData) => {
-    if (motion.accelerationIncludingGravity.x === null || motion.accelerationIncludingGravity.y === null || motion.accelerationIncludingGravity.z === null) return;
-    const processedAccel = { x: motion.accelerationIncludingGravity.x, y: motion.accelerationIncludingGravity.y, z: motion.accelerationIncludingGravity.z };
-    neutralAccelRef.current = processedAccel;
-    filteredAcceleration.current = { ...processedAccel }; 
-    console.log("Calibrated neutral acceleration (Main Game) to:", processedAccel);
-    setHasMoved(false); 
-    diceHitGroundRef.current = false; 
-    groundHitTimeRef.current = null;
-  }, []);
+    if (motion.accelerationIncludingGravity.x === null || 
+        motion.accelerationIncludingGravity.y === null || 
+        motion.accelerationIncludingGravity.z === null) {
+      return
+    }
+    
+    const processedAccel = {
+      x: motion.accelerationIncludingGravity.x,
+      y: motion.accelerationIncludingGravity.y,
+      z: motion.accelerationIncludingGravity.z
+    }
+    
+    neutralAccelRef.current = processedAccel
+    filteredAcceleration.current = processedAccel
+    
+    console.log("Calibrated to acceleration:", processedAccel)
+    setHasMoved(false)
+    diceHitGroundRef.current = false
+    groundHitTimeRef.current = null
+    console.log("Calibration complete. Movement enabled:", isMovingEnabled.current)
+  }, [])
 
   const initFloating = useCallback(() => {
-    if (!worldRef.current) return;
-    console.log("Initializing floating state (Main Game - useAccelerometerDice)");
-    floatingModeRef.current = true; 
-
-    worldRef.current.gravity.set(0, -1, 0); 
-
-    cubesRef.current.forEach((cube) => { 
+    cubesRef.current.forEach((cube) => {
       if (cube.body) {
-        cube.body.type = CANNON.Body.DYNAMIC;
-        cube.body.velocity.set(0,0,0);
-        cube.body.angularVelocity.set(0,0,0);
-        cube.body.linearDamping = FLOATING_LINEAR_DAMPING;
-        cube.body.angularDamping = FLOATING_ANGULAR_DAMPING;
-        cube.body.wakeUp();
+        cube.body.position.y = FLOAT_BASE_HEIGHT
+        cube.body.velocity.set(0, 0, 0)
+        cube.body.angularVelocity.set(0, 0, 0)
+        cube.body.linearDamping = FLOATING_LINEAR_DAMPING
+        cube.body.angularDamping = FLOATING_ANGULAR_DAMPING
+        cube.body.wakeUp()
       }
-    });
+    })
     
-    createDiceConstraints(); 
-    startFloatingAnimation(); 
-  }, [cubesRef, worldRef, createDiceConstraints, startFloatingAnimation]);
+    createDiceConstraints()
+    
+    if (worldRef.current) {
+      worldRef.current.gravity.set(0, -1, 0)
+    }
+    
+    floatingModeRef.current = true
+    startFloatingAnimation()
+    console.log("Initialized floating animation")
+  }, [cubesRef, worldRef, createDiceConstraints, startFloatingAnimation])
 
   const enableMovement = useCallback(() => {
-    console.log("Accelerometer movement EXPLICITLY enabled (Main Game)");
-    isMovingEnabled.current = true;
-
-    if (worldRef.current && floatingModeRef.current) { 
-      worldRef.current.gravity.set(0, -1, 0);
-    }
-
-    cubesRef.current.forEach((cube) => { 
-      cube.body.type = CANNON.Body.DYNAMIC;
-      cube.body.wakeUp();
-    });
+    console.log("Movement EXPLICITLY enabled")
+    isMovingEnabled.current = true
+    floatingModeRef.current = true
     
-    createDiceConstraints(); 
-    setHasMoved(false); 
-    diceHitGroundRef.current = false; 
-    groundHitTimeRef.current = null;
-
-    if (floatingModeRef.current && !floatingAnimState.current.isActive) {
-        startFloatingAnimation();
+    cubesRef.current.forEach((cube) => {
+      cube.body.type = CANNON.Body.DYNAMIC
+      cube.body.wakeUp()
+      cube.body.linearDamping = FLOATING_LINEAR_DAMPING
+      cube.body.angularDamping = FLOATING_ANGULAR_DAMPING
+    })
+    
+    if (worldRef.current) {
+      worldRef.current.gravity.set(0, -1, 0)
     }
-  }, [cubesRef, worldRef, createDiceConstraints, startFloatingAnimation]);
+    
+    createDiceConstraints()
+    setHasMoved(false)
+    diceHitGroundRef.current = false
+    groundHitTimeRef.current = null
+    startFloatingAnimation()
+    
+    console.log("Movement status after enabling:", {
+      isMovingEnabled: isMovingEnabled.current,
+      floatingMode: floatingModeRef.current
+    })
+  }, [cubesRef, worldRef, createDiceConstraints, startFloatingAnimation])
 
   const disableMovement = useCallback(() => {
-    console.log("Accelerometer movement disabled (Main Game)");
-    isMovingEnabled.current = false;
+    console.log("Movement disabled")
+    isMovingEnabled.current = false
+    floatingModeRef.current = false
     
-    setInDeadzone(false);
-    setDeadzoneTimer(null);
-    setDeadzoneProgress(0);
-  }, []);
+    if (worldRef.current) {
+      worldRef.current.gravity.set(0, -30, 0)
+    }
+    
+    setInDeadzone(false)
+    setDeadzoneTimer(null)
+    setDeadzoneProgress(0)
+    setHasMoved(false)
+    diceHitGroundRef.current = false
+    groundHitTimeRef.current = null
+    stopFloatingAnimation()
+  }, [worldRef, stopFloatingAnimation])
 
   const resetNeutralPosition = useCallback((motion: DeviceMotionData) => {
-    if (motion.accelerationIncludingGravity.x === null || motion.accelerationIncludingGravity.y === null || motion.accelerationIncludingGravity.z === null) return;
-    calibrate(motion); 
-    console.log("Neutral position explicitly reset (Main Game).");
-  }, [calibrate]);
+    if (motion.accelerationIncludingGravity.x === null || 
+        motion.accelerationIncludingGravity.y === null || 
+        motion.accelerationIncludingGravity.z === null) {
+      return
+    }
+    
+    const processedAccel = {
+      x: motion.accelerationIncludingGravity.x,
+      y: motion.accelerationIncludingGravity.y,
+      z: motion.accelerationIncludingGravity.z
+    }
+    
+    neutralAccelRef.current = processedAccel
+    filteredAcceleration.current = processedAccel
+    
+    console.log("Neutral position reset to:", processedAccel)
+    setInDeadzone(false)
+    setDeadzoneTimer(null)
+    setDeadzoneProgress(0)
+    setHasMoved(false)
+    diceHitGroundRef.current = false
+    groundHitTimeRef.current = null
+  }, [])
 
-  const startThrow = useCallback( 
-    (throwStrength = DEFAULT_THROW_STRENGTH) => {
-      startShadowFirstThrow(throwStrength); 
-    },
-    [startShadowFirstThrow]
-  );
+  // Execute shadow throw and playback the recording
+  const executeThrow = useCallback(async (throwStrength: number) => {
+    console.log("EXECUTING SHADOW THROW with strength:", throwStrength)
+    
+    if (isThrowingRef.current) return
+    
+    isThrowingRef.current = true
+    setIsThrowing(true)
+    diceHitGroundRef.current = false
+    groundHitTimeRef.current = null
+    floatingModeRef.current = false
+    stopFloatingAnimation()
+    removeAllConstraints()
 
-  const forceThrow = useCallback((throwStrength = DEFAULT_THROW_STRENGTH) => {
-    startThrow(throwStrength);
-  }, [startThrow]);
-
-  const handleMotionUpdate = useCallback(
-    (motionData: DeviceMotionData) => {
-      lastMotion.current = motionData; 
-      if (!motionData.accelerationIncludingGravity.x || !motionData.accelerationIncludingGravity.y || !motionData.accelerationIncludingGravity.z || !neutralAccelRef.current) {
-        return; 
+    try {
+      console.log("Requesting shadow roll recording...")
+      const shadowRecording = await onShadowThrowNeeded(throwStrength)
+      
+      console.log("Shadow roll recording received. Frames:", shadowRecording.frames.length, 
+                  "Rigged:", shadowRecording.isRigged, "Desired:", shadowRecording.desiredResults)
+      
+      if (worldRef.current) {
+        worldRef.current.gravity.set(0, -50, 0)
       }
       
-      processAcceleration(motionData); 
-
-      if (isThrowingRef.current && !playbackStateRef.current.isPlayingBack) {
-        checkForGroundHit();
-        checkIfDiceSettled();
-      } 
-      else if (preThrowAnimationRef.current.isAnimating) {
-        // During pre-throw animation, ignore motion input to allow smooth animation
-        return;
+      cubesRef.current.forEach(cube => {
+        cube.body.type = CANNON.Body.DYNAMIC
+        cube.body.linearDamping = 0.05
+        cube.body.angularDamping = 0.05
+        cube.body.wakeUp()
+      })
+      
+      playbackStateRef.current = {
+        isPlayingBack: true,
+        recording: shadowRecording,
+        startTime: Date.now(),
+        currentFrameIndex: 0,
+        isRigged: shadowRecording.isRigged || false,
+        riggedResults: (shadowRecording.isRigged && shadowRecording.desiredResults) ? shadowRecording.desiredResults : shadowRecording.finalResults
       }
-      else if (isMovingEnabled.current && floatingModeRef.current && !isThrowingRef.current) {
-        if (!worldRef.current) return;
-        
-        const tiltX = filteredAcceleration.current.x - neutralAccelRef.current.x;
-        const tiltMagnitude = Math.abs(tiltX);
-        
-        if (tiltMagnitude <= DEAD_ZONE) { 
-          if (hasMoved && !inDeadzone) { 
-            console.log("ENTERED DEADZONE (Main Game) - Starting throw timer");
-            setInDeadzone(true);
-            setDeadzoneTimer(Date.now()); 
-            setDeadzoneProgress(0);
-          }
-        } 
-        else { 
-          if (inDeadzone) { 
-            console.log("EXITED DEADZONE (Main Game) due to movement");
-            setInDeadzone(false);
-            setDeadzoneTimer(null);
-            setDeadzoneProgress(0);
-          }
-          
-          if (!hasMoved) { 
-            console.log("INITIAL MOVEMENT DETECTED (Main Game)!");
-            setHasMoved(true);
-          }
+      
+      requestAnimationFrame(updatePlayback)
+      
+    } catch (error) {
+      console.error("Shadow roll failed:", error)
+      // Fallback to direct physics if shadow recording fails
+      startDirectThrow(throwStrength)
+    }
+  }, [cubesRef, isThrowingRef, setIsThrowing, worldRef, onShadowThrowNeeded, updatePlayback, stopFloatingAnimation, removeAllConstraints])
 
-          // Calculate tilt strength and apply gravity-based movement
-          if (tiltMagnitude <= TILT_THRESHOLD) {
-            if (floatingModeRef.current) {
-              worldRef.current.gravity.set(0, -1, 0);
-            } else {
-              worldRef.current.gravity.set(0, -30, 0);
-            }
-            return;
-          }
+  // Fallback direct throw for when shadow recording fails
+  const startDirectThrow = useCallback((throwStrength = DEFAULT_THROW_STRENGTH) => {
+    console.log("DIRECT THROW (fallback) initiated, strength:", throwStrength)
+    
+    if (worldRef.current) worldRef.current.gravity.set(0, -50, 0)
+    
+    const baseThrowVelocity = new CANNON.Vec3(
+      0, 
+      DEFAULT_THROW_FORCE_Y * throwStrength, 
+      DEFAULT_THROW_FORCE_Z * throwStrength
+    )
+    
+    cubesRef.current.forEach((cube) => {
+      cube.body.type = CANNON.Body.DYNAMIC
+      cube.body.wakeUp()
+      
+      const variationScale = 0.3 * throwStrength
+      const vx = baseThrowVelocity.x + (Math.random() - 0.5) * variationScale * 2
+      const vy = baseThrowVelocity.y + (Math.random() - 0.5) * variationScale
+      const vz = baseThrowVelocity.z + (Math.random() - 0.5) * variationScale * 3
+      
+      cube.body.velocity.set(vx, vy, vz)
+      
+      const baseAngularStrength = (4 + Math.random() * 4) * throwStrength
+      cube.body.angularVelocity.set(
+        (Math.random() - 0.5) * baseAngularStrength,
+        (Math.random() - 0.5) * baseAngularStrength,
+        (Math.random() - 0.5) * baseAngularStrength
+      )
+      
+      cube.body.linearDamping = 0.05
+      cube.body.angularDamping = 0.05
+    })
+    
+    setHasMoved(false)
+  }, [cubesRef, worldRef, setHasMoved])
+
+  // Function to start throwing dice using shadow recording
+  const startThrow = useCallback(
+    (throwStrength = DEFAULT_THROW_STRENGTH) => {
+      executeThrow(throwStrength)
+    },
+    [executeThrow]
+  )
+
+  const forceThrow = useCallback((throwStrength = DEFAULT_THROW_STRENGTH) => {
+    startThrow(throwStrength)
+  }, [startThrow])
+
+  const handleMotionUpdate = useCallback(
+    (motion: DeviceMotionData) => {
+      lastMotion.current = motion
+      
+      if (!motion.accelerationIncludingGravity.x || 
+          !motion.accelerationIncludingGravity.y || 
+          !motion.accelerationIncludingGravity.z || 
+          !neutralAccelRef.current) {
+        return
+      }
+      
+      // Process and filter acceleration
+      processAcceleration(motion)
+
+      if (isThrowingRef.current) {
+        // During playback, don't interfere with dice physics
+        if (playbackStateRef.current.isPlayingBack) {
+          return
+        }
+        
+        // Handle direct physics throws (fallback only)
+        const tiltX = filteredAcceleration.current.x - neutralAccelRef.current.x
+        const normalizedTiltX = Math.max(-1, Math.min(1, tiltX / 3.0)) * IMPULSE_MULTIPLIER
+        
+        cubesRef.current.forEach((cube) => {
+          const force = new CANNON.Vec3(normalizedTiltX, 0, 0)
+          const torque = new CANNON.Vec3(
+            0,
+            (Math.random() - 0.5) * TORQUE_MULTIPLIER,
+            (Math.random() - 0.5) * TORQUE_MULTIPLIER
+          )
           
-          const tiltStrength = Math.min(1, (Math.abs(tiltX) - DEAD_ZONE) / (1.0 - DEAD_ZONE));
-          const scaledGravity = GRAVITY_STRENGTH * tiltStrength;
-          const gravityX = tiltX * scaledGravity;
+          cube.body.applyForce(force, cube.body.position)
+          cube.body.applyTorque(torque)
+        })
+      } 
+      else if (!isMovingEnabled.current) {
+        return
+      }
+      else {
+        if (!worldRef.current) return
+        
+        const tiltX = filteredAcceleration.current.x - neutralAccelRef.current.x
+        const tiltMagnitude = Math.abs(tiltX)
+        
+        if (tiltMagnitude <= DEAD_ZONE) {
+          if (hasMoved && !inDeadzone) {
+            console.log("ENTERED DEADZONE AFTER MOVEMENT")
+            setInDeadzone(true)
+            setDeadzoneTimer(Date.now())
+            setDeadzoneProgress(0)
+          } else if (!hasMoved) {
+            console.log("In deadzone but waiting for initial movement")
+          }
           
           if (floatingModeRef.current) {
-            worldRef.current.gravity.set(gravityX, -1, 0);
+            worldRef.current.gravity.set(0, -1, 0)
           } else {
-            worldRef.current.gravity.set(gravityX, -30, 0);
+            worldRef.current.gravity.set(0, -30, 0)
           }
+        } 
+        else {
+          if (inDeadzone) {
+            console.log("EXITED DEADZONE")
+            setInDeadzone(false)
+            setDeadzoneTimer(null)
+            setDeadzoneProgress(0)
+          }
+          
+          if (tiltMagnitude <= TILT_THRESHOLD) {
+            if (floatingModeRef.current) {
+              worldRef.current.gravity.set(0, -1, 0)
+            } else {
+              worldRef.current.gravity.set(0, -30, 0)
+            }
+            return
+          }
+          
+          if (!hasMoved) {
+            console.log("INITIAL MOVEMENT DETECTED!")
+            setHasMoved(true)
+          }
+          
+          const tiltStrength = Math.min(1, (Math.abs(tiltX) - DEAD_ZONE) / (1.0 - DEAD_ZONE))
+          const scaledGravity = GRAVITY_STRENGTH * tiltStrength
+          const gravityX = tiltX * scaledGravity
+          
+          if (floatingModeRef.current) {
+            worldRef.current.gravity.set(gravityX, -1, 0)
+          } else {
+            worldRef.current.gravity.set(gravityX, -30, 0)
+          }
+          
+          cubesRef.current.forEach(cube => {
+            if (floatingModeRef.current) {
+              cube.body.linearDamping = FLOATING_LINEAR_DAMPING
+              cube.body.angularDamping = FLOATING_ANGULAR_DAMPING
+            } else {
+              cube.body.linearDamping = LINEAR_DAMPING
+              cube.body.angularDamping = ANGULAR_DAMPING
+            }
+            cube.body.wakeUp()
+          })
+          
+          cubesRef.current.forEach((cube) => {
+            const linearVel = cube.body.velocity
+            const linearSpeed = linearVel.length()
+            if (linearSpeed > MAX_VELOCITY) {
+              linearVel.scale(MAX_VELOCITY / linearSpeed, linearVel)
+            }
+            
+            const angularVel = cube.body.angularVelocity
+            const angularSpeed = angularVel.length()
+            if (angularSpeed > MAX_ANGULAR_VELOCITY) {
+              angularVel.scale(MAX_ANGULAR_VELOCITY / angularSpeed, angularVel)
+            }
+          })
         }
-        applyCohesiveMovement(); 
-        clampDiceVelocities(); 
       }
     },
     [
-      processAcceleration, isThrowingRef, checkForGroundHit, checkIfDiceSettled, 
-      worldRef, hasMoved, inDeadzone, 
-      applyCohesiveMovement, clampDiceVelocities, cubesRef 
-    ]
-  );
+      processAcceleration,
+      cubesRef,
+      hasMoved,
+      inDeadzone,
+      isThrowingRef,
+      worldRef
+    ],
+  )
 
   const getDeadzoneStatus = useCallback((): DeadzoneStatus => {
     return {
-      inDeadzone: inDeadzone && hasMoved, 
+      inDeadzone: inDeadzone && hasMoved,
       progress: deadzoneProgress,
       timeMs: deadzoneTimer ? Date.now() - deadzoneTimer : 0,
       hasMoved: hasMoved,
-      debug: { 
+      debug: {
         startTime: deadzoneTimer,
         currentTime: Date.now(),
-        remaining: deadzoneTimer ? Math.max(0, DEADZONE_THROW_DELAY - (Date.now() - deadzoneTimer)) : DEADZONE_THROW_DELAY
+        remaining: deadzoneTimer ? 
+          Math.max(0, DEADZONE_THROW_DELAY - (Date.now() - deadzoneTimer)) : 0
       }
-    };
-  }, [inDeadzone, deadzoneProgress, deadzoneTimer, hasMoved]);
+    }
+  }, [inDeadzone, deadzoneProgress, deadzoneTimer, hasMoved])
 
   const getAccelerometerDebugInfo = useCallback((): AccelerometerDebugInfo => {
-    const raw = lastMotion.current?.accelerationIncludingGravity;
-    const tiltX = neutralAccelRef.current ? filteredAcceleration.current.x - neutralAccelRef.current.x : 0;
-    const tiltY = neutralAccelRef.current ? filteredAcceleration.current.y - neutralAccelRef.current.y : 0;
-    const mag = Math.sqrt(filteredAcceleration.current.x**2 + filteredAcceleration.current.y**2 + filteredAcceleration.current.z**2);
+    const rawMotion = lastMotion.current
+    let rawAcceleration = null
+    
+    if (rawMotion && 
+        rawMotion.accelerationIncludingGravity.x !== null && 
+        rawMotion.accelerationIncludingGravity.y !== null && 
+        rawMotion.accelerationIncludingGravity.z !== null) {
+      rawAcceleration = {
+        x: rawMotion.accelerationIncludingGravity.x.toFixed(2),
+        y: rawMotion.accelerationIncludingGravity.y.toFixed(2),
+        z: rawMotion.accelerationIncludingGravity.z.toFixed(2)
+      }
+    }
+    
+    const tiltX = neutralAccelRef.current && filteredAcceleration.current 
+      ? filteredAcceleration.current.x - neutralAccelRef.current.x
+      : 0
+      
+    const tiltY = neutralAccelRef.current && filteredAcceleration.current 
+      ? filteredAcceleration.current.y - neutralAccelRef.current.y
+      : 0
+    
+    const accelerationMagnitude = Math.sqrt(
+      filteredAcceleration.current.x * filteredAcceleration.current.x +
+      filteredAcceleration.current.y * filteredAcceleration.current.y +
+      filteredAcceleration.current.z * filteredAcceleration.current.z
+    )
+    
     return {
-      rawAcceleration: raw && raw.x !== null && raw.y !== null && raw.z !== null 
-        ? { x: raw.x.toFixed(2), y: raw.y.toFixed(2), z: raw.z.toFixed(2) } 
-        : null,
-      filteredAcceleration: { 
-        x: filteredAcceleration.current.x.toFixed(2), 
-        y: filteredAcceleration.current.y.toFixed(2), 
-        z: filteredAcceleration.current.z.toFixed(2) 
+      rawAcceleration,
+      filteredAcceleration: {
+        x: filteredAcceleration.current.x.toFixed(2),
+        y: filteredAcceleration.current.y.toFixed(2),
+        z: filteredAcceleration.current.z.toFixed(2)
       },
-      acceleration: parseFloat(mag.toFixed(2)),
-      tiltX: parseFloat(tiltX.toFixed(2)), 
-      tiltY: parseFloat(tiltY.toFixed(2)),
-    };
-  }, []); 
+      acceleration: parseFloat(accelerationMagnitude.toFixed(2)),
+      tiltX: parseFloat(tiltX.toFixed(2)),
+      tiltY: parseFloat(tiltY.toFixed(2))
+    }
+  }, [])
 
-  const isMovementEnabledHook = useCallback(() => isMovingEnabled.current, []);
-  const isFloatingModeHook = useCallback(() => floatingModeRef.current, []);
+  const isMovementEnabled = useCallback(() => {
+    return isMovingEnabled.current
+  }, [])
+
+  const isFloatingMode = useCallback(() => {
+    return floatingModeRef.current
+  }, [])
+
+  const getGroundHitStatus = useCallback(() => {
+    return {
+      hasHitGround: diceHitGroundRef.current,
+      hitTime: groundHitTimeRef.current
+    }
+  }, [])
 
   return {
-    handleMotionUpdate, startThrow, forceThrow, enableMovement, disableMovement,
-    resetNeutralPosition, getDeadzoneStatus, getAccelerometerDebugInfo, calibrate,
-    isMovementEnabled: isMovementEnabledHook, 
-    isFloatingMode: isFloatingModeHook,     
-    initFloating 
-  };
-};
+    handleMotionUpdate,
+    startThrow,
+    forceThrow,
+    enableMovement,
+    disableMovement,
+    resetNeutralPosition,
+    getDeadzoneStatus,
+    getAccelerometerDebugInfo,
+    calibrate,
+    isMovementEnabled,
+    isFloatingMode,
+    getGroundHitStatus,
+    initFloating
+  }
+}

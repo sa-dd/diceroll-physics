@@ -1,30 +1,84 @@
-// dice-game.tsx
-
 "use client"
 
 import type React from "react"
 import { useEffect, useRef, useMemo, useState, useCallback } from "react"
 import * as THREE from "three"
 import * as CANNON from "cannon-es"
+import CannonDebugger from 'cannon-es-debugger'
 import { useWindowResize } from "./hooks"
 import { useDeviceMotion } from "./hooks/use-device-motion"
 import { useAccelerometerDice } from "./hooks/use-accelerometer-dice"
-import { spawnWalls as actualSpawnWalls } from "./game-walls" 
+import { spawnWalls } from "./game-walls"
 import { RollScreen } from "./roll-screen"
 import type { Cube } from "./game-board"
 
-const DEFAULT_THROW_FORCE_Y = 6.0;      
-const DEFAULT_THROW_FORCE_Z = -32.0;    
-const DEFAULT_THROW_STRENGTH = 1.5;  
-const SHADOW_FLOAT_BASE_Y_OFFSET = 2;
+interface Props {
+  className?: string
+}
 
-// Working rigging constants from paste.txt
+// Define constraint interfaces
+interface ConstraintData {
+  constraint: CANNON.DistanceConstraint;
+  bodyA: CANNON.Body;
+  bodyB: CANNON.Body;
+}
+
+// Define type for accelerometer debug info
+interface AccelerometerDebugInfo {
+  rawAcceleration: {
+    x: string;
+    y: string;
+    z: string;
+  } | null;
+  filteredAcceleration: {
+    x: string;
+    y: string;
+    z: string;
+  };
+  acceleration: number;
+  tiltX: number;
+  tiltY: number;
+}
+
+// Define type for deadzone status
+interface DeadzoneStatus {
+  inDeadzone: boolean;
+  progress: number;
+  timeMs: number;
+  hasMoved: boolean;
+  debug: {
+    startTime: number | null;
+    currentTime: number;
+    remaining: number;
+  };
+}
+
+// Shadow recording interfaces
+interface PhysicsFrame {
+  timestamp: number
+  diceStates: {
+    position: { x: number, y: number, z: number }
+    quaternion: { x: number, y: number, z: number, w: number }
+    velocity: { x: number, y: number, z: number }
+    angularVelocity: { x: number, y: number, z: number }
+  }[]
+}
+
+interface ShadowRecording {
+  frames: PhysicsFrame[]
+  finalResults: number[]
+  isComplete: boolean
+  isRigged?: boolean
+  desiredResults?: number[]
+}
+
+// Rigging constants
 const TRANSITION_FRAMES = 15
 const VELOCITY_SETTLE_THRESHOLD = 2.0
-const MIDAIR_HEIGHT_THRESHOLD = 2.0
+const MIDAIR_HEIGHT_THRESHOLD = 5.0
 const PHYSICS_INFLUENCE_FRAMES = 40
 
-// Face orientation mapping from working system
+// Face orientation mapping
 const FACE_VALUE_TO_NORMAL = new Map<number, THREE.Vector3>([
   [1, new THREE.Vector3(1, 0, 0)],    // 1 is on right face (+X)
   [6, new THREE.Vector3(-1, 0, 0)],   // 6 is on left face (-X)
@@ -128,71 +182,39 @@ const RIGGING_PRESETS: Record<RiggingPreset, RiggingPresetConfig> = {
   }
 };
 
-interface Props {
-  className?: string
-}
+// Shadow constants
+const DEFAULT_THROW_FORCE_Y = 2.0
+const DEFAULT_THROW_FORCE_Z = -32.0
+const DEFAULT_THROW_STRENGTH = 1.5
+const SHADOW_FLOAT_BASE_Y_OFFSET = 2
 
-interface ConstraintData {
-  constraint: CANNON.DistanceConstraint;
-  bodyA: CANNON.Body;
-  bodyB: CANNON.Body;
-}
-
-interface AccelerometerDebugInfo {
-  rawAcceleration: { x: string; y: string; z: string; } | null;
-  filteredAcceleration: { x: string; y: string; z: string; };
-  acceleration: number;
-  tiltX: number;
-  tiltY: number;
-}
-
-interface DeadzoneStatus {
-  inDeadzone: boolean; 
-  progress: number;
-  timeMs: number;
-  hasMoved: boolean; 
-  debug: {
-    startTime: number | null;
-    currentTime: number;
-    remaining: number;
-  };
-}
-
-// New interfaces for shadow recording
-interface PhysicsFrame {
-  timestamp: number
-  diceStates: {
-    position: { x: number, y: number, z: number }
-    quaternion: { x: number, y: number, z: number, w: number }
-    velocity: { x: number, y: number, z: number }
-    angularVelocity: { x: number, y: number, z: number }
-  }[]
-}
-
-interface ShadowRecording {
-  frames: PhysicsFrame[]
-  finalResults: number[]
-  isComplete: boolean
-  isRigged?: boolean
-  desiredResults?: number[]
-}
+// Debug mode toggle - set to true to show accelerometer values
+const DEBUG_MODE = true;
+const DEADZONE_THROW_DELAY = 5;
 
 export const DiceGame: React.FC<Props> = ({ className }) => {
   const mountRef = useRef<HTMLDivElement>(null)
   
+  // Main world refs
   const cubesRef = useRef<Cube[]>([])
-  const initialPositionsRef = useRef<CANNON.Vec3[]>([]) 
+  const initialPositionsRef = useRef<CANNON.Vec3[]>([])
   const constraintsRef = useRef<ConstraintData[]>([])
   const worldRef = useRef<CANNON.World | null>(null)
-
+  
+  // Shadow world refs
   const shadowWorldRef = useRef<CANNON.World | null>(null)
   const shadowCubesRef = useRef<Cube[]>([])
-  const shadowInitialPositionsRef = useRef<CANNON.Vec3[]>([]) 
+  const shadowInitialPositionsRef = useRef<CANNON.Vec3[]>([])
   const shadowConstraintsRef = useRef<ConstraintData[]>([])
-  const [isShadowDiceThrown, setIsShadowDiceThrown] = useState(false); 
-  const shadowRollInProgressRef = useRef(false); 
+  const [isShadowDiceThrown, setIsShadowDiceThrown] = useState(false)
+  const shadowRollInProgressRef = useRef(false)
+  
+  // Cannon debugger refs
+  const cannonDebuggerRef = useRef<any>(null)
+  const shadowDebuggerRef = useRef<any>(null)
+  const [showShadowDebug, setShowShadowDebug] = useState(false)
 
-  // New state for shadow recording - removed desiredResults from here since we'll get them fresh
+  // Shadow recording state
   const shadowRecordingRef = useRef<{
     isRecording: boolean
     frames: PhysicsFrame[]
@@ -206,25 +228,52 @@ export const DiceGame: React.FC<Props> = ({ className }) => {
   });
 
   const [rollResults, setRollResults] = useState<number[]>([])
-  const [isThrowing, setIsThrowing] = useState<boolean>(false) 
-  const isThrowingRef = useRef<boolean>(false) 
-  const [isVisible, setVisible] = useState(false) 
+  const [isThrowing, setIsThrowing] = useState<boolean>(false)
+  const isThrowingRef = useRef<boolean>(false)
+  const [isVisible, setVisible] = useState(false)
+  const [accessGranted, setAccessGranted] = useState(false)
   const rollScreenAnimationTimeRef = useRef<number>(400)
   const neutralPositionSetRef = useRef<boolean>(false)
-  const floatingInitializedRef = useRef<boolean>(false) 
+  const floatingInitializedRef = useRef<boolean>(false)
+  
+  // State for tracking if movement is unlocked by shake
   const [movementUnlocked, setMovementUnlocked] = useState(false)
   
+  // State for floating mode tracking
+  const [isFloating, setIsFloating] = useState(true)
+  
+  // Debug mode state
+  const [debugMode, setDebugMode] = useState<boolean>(false)
+  
+  // State for accelerometer values - only care about X for movement
   const [accelerometerValues, setAccelerometerValues] = useState<{
-    x: number | null; y: number | null; z: number | null; tiltX: number; tiltY: number;
-  }>({ x: null, y: null, z: null, tiltX: 0, tiltY: 0 });
+    x: number | null;
+    y: number | null;
+    z: number | null;
+    tiltX: number;
+    tiltY: number;
+  }>({
+    x: null,
+    y: null,
+    z: null,
+    tiltX: 0,
+    tiltY: 0
+  });
+  
+  // State for accelerometer debug info
   const [accelDebugInfo, setAccelDebugInfo] = useState<AccelerometerDebugInfo | null>(null);
   
+  // Properly typed deadzone state
   const [deadzoneState, setDeadzoneState] = useState<DeadzoneStatus>({
-    inDeadzone: false, 
+    inDeadzone: false,
     progress: 0,
     timeMs: 0,
-    hasMoved: false, 
-    debug: { startTime: null, currentTime: Date.now(), remaining: 0 }
+    hasMoved: false,
+    debug: {
+      startTime: null,
+      currentTime: Date.now(),
+      remaining: 0
+    }
   });
 
   // Rigging preset state
@@ -247,7 +296,50 @@ export const DiceGame: React.FC<Props> = ({ className }) => {
     console.log("Updated rigging ref to:", currentRiggingRef.current);
   }, [selectedPreset, customResults]);
 
-  // Working rigging functions copied from paste.txt
+  // Shadow dice synchronization function
+  const syncShadowDiceWithMain = useCallback(() => {
+    // Only sync when not recording a shadow throw
+    if (shadowRecordingRef.current.isRecording) return;
+    
+    // Ensure both dice arrays have the same length
+    if (cubesRef.current.length !== shadowCubesRef.current.length) return;
+    
+    cubesRef.current.forEach((mainCube, index) => {
+      const shadowCube = shadowCubesRef.current[index];
+      if (!mainCube?.body || !shadowCube?.body) return;
+      
+      // Copy position
+      shadowCube.body.position.copy(mainCube.body.position);
+      
+      // Copy rotation/quaternion
+      shadowCube.body.quaternion.copy(mainCube.body.quaternion);
+      
+      // Copy velocity
+      shadowCube.body.velocity.copy(mainCube.body.velocity);
+      
+      // Copy angular velocity
+      shadowCube.body.angularVelocity.copy(mainCube.body.angularVelocity);
+      
+      // Copy physics properties
+      shadowCube.body.linearDamping = mainCube.body.linearDamping;
+      shadowCube.body.angularDamping = mainCube.body.angularDamping;
+      shadowCube.body.type = mainCube.body.type;
+      
+      // Wake up the shadow cube to ensure physics updates
+      if (mainCube.body.sleepState !== CANNON.Body.SLEEPING) {
+        shadowCube.body.wakeUp();
+      } else {
+        shadowCube.body.sleep();
+      }
+    });
+    
+    // Sync world gravity
+    if (worldRef.current && shadowWorldRef.current) {
+      shadowWorldRef.current.gravity.copy(worldRef.current.gravity);
+    }
+  }, []);
+
+  // Working rigging functions
   const calculateOrientationForFaceValue = useCallback((faceValue: number): CANNON.Quaternion => {
     const upVector = FACE_VALUE_TO_NORMAL.get(faceValue);
     if (!upVector) {
@@ -583,7 +675,7 @@ export const DiceGame: React.FC<Props> = ({ className }) => {
     return transitionFrames;
   }, [calculateOrientationForFaceValue, slerpQuaternions]);
 
-  // Get fresh desired results each time - this is the key fix
+  // Get fresh desired results each time
   const generateDesiredResults = useCallback((): number[] => {
     const currentPreset = currentRiggingRef.current.preset;
     const currentCustom = currentRiggingRef.current.customResults;
@@ -603,9 +695,9 @@ export const DiceGame: React.FC<Props> = ({ className }) => {
     
     console.log(`Rigging with preset "${preset.name}": [${results.join(', ')}] = ${results.reduce((a, b) => a + b, 0)}`);
     return results;
-  }, []); // No dependencies needed since we use ref
+  }, []);
 
-  // Updated rigRecording to get fresh desired results instead of using cached ones
+  // Rig recording to get desired results
   const rigRecording = useCallback((recording: ShadowRecording): ShadowRecording => {
     const currentPreset = currentRiggingRef.current.preset;
     const currentCustomResults = currentRiggingRef.current.customResults;
@@ -687,8 +779,9 @@ export const DiceGame: React.FC<Props> = ({ className }) => {
                 recording.finalResults, "->", riggedRecording.finalResults);
     
     return riggedRecording;
-  }, [findMidairPoint, findSettleIndex, createNaturalTransitionFrames, createTransitionFrames]); // Removed selectedPreset and customResults since we use ref
+  }, [findMidairPoint, findSettleIndex, createNaturalTransitionFrames, createTransitionFrames]);
 
+  // Generic constraint functions
   const createGenericDiceConstraints = useCallback((
     targetWorld: CANNON.World | null,
     targetCubes: Cube[],
@@ -709,14 +802,6 @@ export const DiceGame: React.FC<Props> = ({ className }) => {
     }
   }, []);
 
-  const createMainDiceConstraints = useCallback(() => {
-    createGenericDiceConstraints(worldRef.current, cubesRef.current, constraintsRef);
-  }, [createGenericDiceConstraints]);
-
-  const createShadowDiceConstraints = useCallback(() => {
-    createGenericDiceConstraints(shadowWorldRef.current, shadowCubesRef.current, shadowConstraintsRef);
-  }, [createGenericDiceConstraints]);
-  
   const removeAllGenericConstraints = useCallback((
     targetWorld: CANNON.World | null,
     targetConstraints: React.MutableRefObject<ConstraintData[]>
@@ -726,30 +811,60 @@ export const DiceGame: React.FC<Props> = ({ className }) => {
     targetConstraints.current = [];
   }, []);
 
-  const removeAllMainConstraints = useCallback(() => {
+  // Function to reset dice to their starting positions
+  const resetDicePositions = useCallback(() => {
+    if (cubesRef.current.length === 0 || initialPositionsRef.current.length === 0) return;
+
+    // First remove all constraints
+    if (worldRef.current && constraintsRef.current.length > 0) {
+      constraintsRef.current.forEach(data => {
+        worldRef.current?.removeConstraint(data.constraint);
+      });
+    }
+
+    cubesRef.current.forEach((cube, index) => {
+      if (index < initialPositionsRef.current.length) {
+        const initialPos = initialPositionsRef.current[index];
+        
+        // Position dice higher to allow for floating
+        cube.body.position.copy(initialPos);
+        cube.body.position.y += 2; // Position higher for floating effect
+        
+        // Reset velocity and rotation
+        cube.body.velocity.set(0, 0, 0);
+        cube.body.angularVelocity.set(0, 0, 0);
+        
+        // Set to awake state
+        cube.body.wakeUp();
+      }
+    });
+
+    // Recreate constraints after resetting positions
+    createDiceConstraints();
+    
+    // Set low gravity if movement is enabled
+    if (isMovementEnabled() && worldRef.current) {
+      worldRef.current.gravity.set(0, -1, 0);
+    }
+  }, []);
+
+  // Function to create constraints between dice
+  const createDiceConstraints = useCallback(() => {
+    createGenericDiceConstraints(worldRef.current, cubesRef.current, constraintsRef);
+  }, [createGenericDiceConstraints]);
+
+  const createShadowDiceConstraints = useCallback(() => {
+    createGenericDiceConstraints(shadowWorldRef.current, shadowCubesRef.current, shadowConstraintsRef);
+  }, [createGenericDiceConstraints]);
+
+  // Function to remove all constraints between dice
+  const removeAllConstraints = useCallback(() => {
     removeAllGenericConstraints(worldRef.current, constraintsRef);
   }, [removeAllGenericConstraints]);
 
   const removeAllShadowConstraints = useCallback(() => {
     removeAllGenericConstraints(shadowWorldRef.current, shadowConstraintsRef);
   }, [removeAllGenericConstraints]);
-
-  const resetMainDicePositions = useCallback(() => {
-    if (cubesRef.current.length === 0 || initialPositionsRef.current.length === 0 || !worldRef.current) return;
-    removeAllMainConstraints();
-    cubesRef.current.forEach((cube, index) => {
-      if (index < initialPositionsRef.current.length) {
-        const initialPos = initialPositionsRef.current[index];
-        cube.body.type = CANNON.Body.DYNAMIC;
-        cube.body.position.copy(initialPos);
-        cube.body.velocity.set(0, 0, 0);
-        cube.body.angularVelocity.set(0, 0, 0);
-        cube.body.linearDamping = 0.8 
-        cube.body.angularDamping = 0.1; 
-        cube.body.wakeUp();
-      }
-    });
-  }, [removeAllMainConstraints]); 
 
   const getShadowDiceValue = useCallback((cube: Cube): number => {
     const worldUp = new THREE.Vector3(0, 1, 0)
@@ -774,7 +889,7 @@ export const DiceGame: React.FC<Props> = ({ className }) => {
   const recordShadowFrame = useCallback(() => {
     if (!shadowRecordingRef.current.isRecording) return;
     
-    const SHADOW_SPEED_MULTIPLIER = 6;
+    const SHADOW_SPEED_MULTIPLIER = 10;
     const frameTime = shadowRecordingRef.current.frames.length * (1000 / 60) * SHADOW_SPEED_MULTIPLIER;
     
     const diceStates = shadowCubesRef.current.map(cube => ({
@@ -807,7 +922,7 @@ export const DiceGame: React.FC<Props> = ({ className }) => {
     });
   }, []);
 
-const resetShadowDiceToFloatingState = useCallback(() => {
+  const resetShadowDiceToFloatingState = useCallback(() => {
     if (!shadowWorldRef.current || shadowCubesRef.current.length === 0 || shadowInitialPositionsRef.current.length === 0) return;
     removeAllShadowConstraints();
     setIsShadowDiceThrown(false); 
@@ -846,7 +961,7 @@ const resetShadowDiceToFloatingState = useCallback(() => {
       isComplete: true
     };
     
-    // Apply rigging if enabled - this now gets fresh desired results
+    // Apply rigging if enabled
     console.log("About to call rigRecording with current preset:", currentRiggingRef.current.preset);
     recording = rigRecording(recording);
     console.log("After rigging, final results are:", recording.finalResults);
@@ -867,13 +982,13 @@ const resetShadowDiceToFloatingState = useCallback(() => {
     setTimeout(() => {
       resetShadowDiceToFloatingState();
     }, 1000);
-  }, [recordShadowFrame, getShadowDiceValue, rigRecording, resetShadowDiceToFloatingState]); // Removed selectedPreset since we use ref
+  }, [recordShadowFrame, getShadowDiceValue, rigRecording, resetShadowDiceToFloatingState]);
 
   const simulateShadowRollFast = useCallback(() => {
     if (!shadowWorldRef.current || !shadowRecordingRef.current.isRecording) return;
     
     const FAST_TIME_STEP = 1/60;
-    const STEPS_PER_FRAME = 6;
+    const STEPS_PER_FRAME = 10;
     const MAX_SIMULATION_FRAMES = 300;
     let frameCount = 0;
     let simulationTime = 0;
@@ -915,509 +1030,681 @@ const resetShadowDiceToFloatingState = useCallback(() => {
     requestAnimationFrame(fastSimulate);
   }, [recordShadowFrame, completeShadowRecording]);
 
-  // Simplified executeShadowThrow - no longer caches desired results
+  // Execute shadow throw
   const executeShadowThrow = useCallback((throwStrength: number): Promise<ShadowRecording> => {
-  return new Promise((resolve) => {
-    console.log("EXECUTING SHADOW THROW with preset:", currentRiggingRef.current.preset, "strength:", throwStrength);
-    
-    if (!shadowWorldRef.current || shadowCubesRef.current.length === 0) {
-      console.error("Shadow world not ready");
-      resolve({ frames: [], finalResults: [1, 1, 1], isComplete: false });
-      return;
-    }
+    return new Promise((resolve) => {
+      console.log("EXECUTING SHADOW THROW with preset:", currentRiggingRef.current.preset, "strength:", throwStrength);
+      
+      if (!shadowWorldRef.current || shadowCubesRef.current.length === 0) {
+        console.error("Shadow world not ready");
+        resolve({ frames: [], finalResults: [1, 1, 1], isComplete: false });
+        return;
+      }
 
-    shadowCubesRef.current.forEach((cube, index) => {
-      if (index < shadowInitialPositionsRef.current.length) {
-        const basePos = shadowInitialPositionsRef.current[index];
+      shadowCubesRef.current.forEach((cube) => {
+        // Keep current position (which should be synced with main dice)
         cube.body.type = CANNON.Body.DYNAMIC;
-        cube.body.position.set(basePos.x, basePos.y + SHADOW_FLOAT_BASE_Y_OFFSET, basePos.z);
         cube.body.velocity.set(0, 0, 0);
         cube.body.angularVelocity.set(0, 0, 0);
         cube.body.wakeUp();
+      });
+
+      shadowRecordingRef.current = {
+        isRecording: true,
+        frames: [],
+        startTime: 0,
+        resolvePromise: resolve
+      };
+
+      setIsShadowDiceThrown(true);
+      shadowRollInProgressRef.current = true;
+      removeAllShadowConstraints();
+
+      if (shadowWorldRef.current) {
+        shadowWorldRef.current.gravity.set(0, -50, 0);
       }
-    });
 
-    // Simplified shadow recording ref without caching desired results
-    shadowRecordingRef.current = {
-      isRecording: true,
-      frames: [],
-      startTime: 0,
-      resolvePromise: resolve
-    };
-
-    setIsShadowDiceThrown(true);
-    shadowRollInProgressRef.current = true;
-    removeAllShadowConstraints();
-
-    if (shadowWorldRef.current) {
-      shadowWorldRef.current.gravity.set(0, -50, 0);
-    }
-
-    const baseThrowVelocity = new CANNON.Vec3(
-      0, 
-      DEFAULT_THROW_FORCE_Y * throwStrength,
-      DEFAULT_THROW_FORCE_Z * throwStrength
-    );
-
-    shadowCubesRef.current.forEach((cube, index) => {
-      cube.body.type = CANNON.Body.DYNAMIC;
-      cube.body.wakeUp();
-      cube.body.linearDamping = 0.05;
-      cube.body.angularDamping = 0.05;
-
-      // Add random initial rotation to each shadow die before throwing
-      const randomInitialRotation = new CANNON.Quaternion();
-      randomInitialRotation.setFromAxisAngle(
-        new CANNON.Vec3(
-          Math.random() - 0.5,
-          Math.random() - 0.5, 
-          Math.random() - 0.5
-        ).unit(),
-        Math.random() * Math.PI * 2 // Random rotation up to 360 degrees
+      const baseThrowVelocity = new CANNON.Vec3(
+        0, 
+        DEFAULT_THROW_FORCE_Y * throwStrength,
+        DEFAULT_THROW_FORCE_Z * throwStrength
       );
-      cube.body.quaternion = cube.body.quaternion.mult(randomInitialRotation);
 
-      const variationScale = 0.3 * throwStrength;
-      const vx = baseThrowVelocity.x + (Math.random() - 0.5) * variationScale * 2;
-      const vy = baseThrowVelocity.y + (Math.random() - 0.5) * variationScale;
-      const vz = baseThrowVelocity.z + (Math.random() - 0.5) * variationScale * 3;
+      shadowCubesRef.current.forEach((cube, index) => {
+        cube.body.type = CANNON.Body.DYNAMIC;
+        cube.body.wakeUp();
+        cube.body.linearDamping = 0.05;
+        cube.body.angularDamping = 0.05;
+
+        // Add random initial rotation
+        const randomInitialRotation = new CANNON.Quaternion();
+        randomInitialRotation.setFromAxisAngle(
+          new CANNON.Vec3(
+            Math.random() - 0.5,
+            Math.random() - 0.5, 
+            Math.random() - 0.5
+          ).unit(),
+          Math.random() * Math.PI * 2
+        );
+        cube.body.quaternion = cube.body.quaternion.mult(randomInitialRotation);
+
+        const variationScale = 0.3 * throwStrength;
+        const vx = baseThrowVelocity.x + (Math.random() - 0.5) * variationScale * 2;
+        const vy = baseThrowVelocity.y + (Math.random() - 0.5) * variationScale;
+        const vz = baseThrowVelocity.z + (Math.random() - 0.5) * variationScale * 3;
+        
+        cube.body.velocity.set(vx, vy, vz);
+        
+        // Enhanced random angular velocity
+        const baseAngularStrength = (4 + Math.random() * 4) * throwStrength;
+        
+        const angularX = (Math.random() - 0.5) * baseAngularStrength * (0.5 + Math.random() * 1.5);
+        const angularY = (Math.random() - 0.5) * baseAngularStrength * (0.5 + Math.random() * 1.5);
+        const angularZ = (Math.random() - 0.5) * baseAngularStrength * (0.5 + Math.random() * 1.5);
+        
+        const biasX = Math.sin(index * 1.2) * 2 * throwStrength;
+        const biasY = Math.cos(index * 0.8) * 2 * throwStrength;
+        const biasZ = Math.sin(index * 1.5) * 2 * throwStrength;
+        
+        cube.body.angularVelocity.set(
+          angularX + biasX,
+          angularY + biasY,
+          angularZ + biasZ
+        );
+        
+        // Add occasional extra spin boost
+        if (Math.random() < 0.3) {
+          const spinBoost = 3 + Math.random() * 4;
+          const spinAxis = Math.floor(Math.random() * 3);
+          if (spinAxis === 0) cube.body.angularVelocity.x += (Math.random() - 0.5) * spinBoost;
+          else if (spinAxis === 1) cube.body.angularVelocity.y += (Math.random() - 0.5) * spinBoost;
+          else cube.body.angularVelocity.z += (Math.random() - 0.5) * spinBoost;
+        }
+      });
+
+      console.log("Shadow throw forces applied, starting simulation");
       
-      cube.body.velocity.set(vx, vy, vz);
-      
-      // Enhanced random angular velocity with more variation per die
-      const baseAngularStrength = (4 + Math.random() * 4) * throwStrength; // Increased base strength
-      
-      // Each axis gets different random multipliers for more chaotic rotation
-      const angularX = (Math.random() - 0.5) * baseAngularStrength * (0.5 + Math.random() * 1.5);
-      const angularY = (Math.random() - 0.5) * baseAngularStrength * (0.5 + Math.random() * 1.5);
-      const angularZ = (Math.random() - 0.5) * baseAngularStrength * (0.5 + Math.random() * 1.5);
-      
-      // Add some bias towards certain rotations to make it look more natural
-      const biasX = Math.sin(index * 1.2) * 2 * throwStrength;
-      const biasY = Math.cos(index * 0.8) * 2 * throwStrength;
-      const biasZ = Math.sin(index * 1.5) * 2 * throwStrength;
-      
-      cube.body.angularVelocity.set(
-        angularX + biasX,
-        angularY + biasY,
-        angularZ + biasZ
-      );
-      
-      // Add occasional extra spin boost for dramatic effect
-      if (Math.random() < 0.3) { // 30% chance for extra spin
-        const spinBoost = 3 + Math.random() * 4;
-        const spinAxis = Math.floor(Math.random() * 3);
-        if (spinAxis === 0) cube.body.angularVelocity.x += (Math.random() - 0.5) * spinBoost;
-        else if (spinAxis === 1) cube.body.angularVelocity.y += (Math.random() - 0.5) * spinBoost;
-        else cube.body.angularVelocity.z += (Math.random() - 0.5) * spinBoost;
-      }
+      simulateShadowRollFast();
     });
+  }, [removeAllShadowConstraints, simulateShadowRollFast]);
 
-    console.log("Shadow throw forces applied, starting simulation");
-    
-    simulateShadowRollFast();
-  });
-}, [removeAllShadowConstraints, simulateShadowRollFast]); // Removed selectedPreset since we use ref
-
-  // Initialize accelerometer dice with shadow callback
+  // Get the updated hook with accelerometer-based movement control
   const { 
-    handleMotionUpdate, startThrow, forceThrow, enableMovement, disableMovement,
-    resetNeutralPosition, getDeadzoneStatus, getAccelerometerDebugInfo, calibrate,
-    isMovementEnabled: isMainMovementEnabled, 
-    isFloatingMode: isMainFloatingMode,     
-    initFloating: initMainDiceFloating
+    handleMotionUpdate, 
+    startThrow,
+    forceThrow,
+    enableMovement, 
+    disableMovement,
+    resetNeutralPosition,
+    getDeadzoneStatus,
+    getAccelerometerDebugInfo,
+    calibrate,
+    isMovementEnabled,
+    isFloatingMode,
+    initFloating
   } = useAccelerometerDice(
-    cubesRef, isThrowingRef, setRollResults, setIsThrowing,
-    resetMainDicePositions, worldRef, removeAllMainConstraints, createMainDiceConstraints,
-    executeShadowThrow,
-    initialPositionsRef
+    cubesRef, 
+    isThrowingRef, 
+    setRollResults, 
+    setIsThrowing,
+    resetDicePositions,
+    worldRef,
+    removeAllConstraints,
+    createDiceConstraints,
+    executeShadowThrow
   );
 
-  const { motion, isShaking, accessGranted: motionAccessGranted, requestAccess: requestMotionAccess } = useDeviceMotion({
-    shakeThreshold: 4.5
+  // Get device motion data using our new hook
+  const { 
+    motion, 
+    isShaking, 
+    accessGranted: motionAccessGranted, 
+    requestAccess: requestMotionAccess, 
+    revokeAccess: revokeMotionAccess 
+  } = useDeviceMotion({
+    shakeThreshold: 2.5
   });
 
-  useEffect(() => { isThrowingRef.current = isThrowing }, [isThrowing]); 
+  useEffect(() => {
+    isThrowingRef.current = isThrowing
+  }, [isThrowing])
 
-  
-  useEffect(() => { 
-    if (floatingInitializedRef.current || !worldRef.current || cubesRef.current.length === 0 || !initialPositionsRef.current.length) return;
+  // Initialize floating animation at startup
+  useEffect(() => {
+    if (floatingInitializedRef.current || 
+        !worldRef.current || 
+        cubesRef.current.length === 0 || 
+        !initialPositionsRef.current.length) {
+      return;
+    }
+    
     const initTimer = setTimeout(() => {
-      initMainDiceFloating();
+      initFloating();
       floatingInitializedRef.current = true;
+      setIsFloating(true);
+      console.log("Initialized floating animation on startup");
     }, 500);
+    
     return () => clearTimeout(initTimer);
-  }, [initMainDiceFloating]);
+  }, [worldRef, cubesRef, initialPositionsRef, initFloating]);
 
-  useEffect(() => { 
+  // Modified effect: Set neutral position and handle initial setup
+  useEffect(() => {
     if (motionAccessGranted && motion && !neutralPositionSetRef.current && !isThrowing && !isVisible) {
       calibrate(motion);
       neutralPositionSetRef.current = true;
+      
+      if (constraintsRef.current.length === 0) {
+        createDiceConstraints();
+      }
+      
       if (!floatingInitializedRef.current) {
-        initMainDiceFloating();
+        initFloating();
         floatingInitializedRef.current = true;
-      } else if(isMainFloatingMode()){ 
-          createMainDiceConstraints();
+        setIsFloating(true);
       }
     }
-  }, [motionAccessGranted, motion, calibrate, isThrowing, isVisible, initMainDiceFloating, isMainFloatingMode, createMainDiceConstraints]);
+  }, [motionAccessGranted, motion, calibrate, isThrowing, isVisible, createDiceConstraints, initFloating]);
 
-  useEffect(() => { 
-    if (movementUnlocked || isThrowing || isVisible) return;
-    if (motionAccessGranted && isShaking) {
-      setMovementUnlocked(true);
-      enableMovement(); 
+  // Effect to handle shake detection
+  useEffect(() => {
+    if (movementUnlocked || isThrowing || isVisible) {
+      return;
     }
-  }, [motionAccessGranted, isShaking, movementUnlocked, enableMovement, isThrowing, isVisible]);
+    
+    if (motionAccessGranted && isShaking) {
+      console.log("Shake detected! Unlocking movement with floating mode.");
+      setMovementUnlocked(true);
+      setIsFloating(true);
+      
+      setTimeout(() => {
+        enableMovement();
+        
+        if (worldRef.current) {
+          worldRef.current.gravity.set(0, -1, 0);
+        }
+      }, 100);
+    }
+  }, [motionAccessGranted, isShaking, movementUnlocked, enableMovement, isThrowing, isVisible, worldRef]);
 
+  // Update floating state based on dice controller state
+  useEffect(() => {
+    if (!isThrowing && !isVisible) {
+      const floatingState = isFloatingMode();
+      setIsFloating(floatingState);
+    }
+  }, [isThrowing, isVisible, isFloatingMode]);
+
+  // Poll deadzone status frequently for UI updates
   useEffect(() => {
     if (!isThrowing && !isVisible) {
       const updateStatus = () => {
-        setDeadzoneState(getDeadzoneStatus());
+        const status = getDeadzoneStatus();
+        setDeadzoneState(status);
+        
         const debugInfo = getAccelerometerDebugInfo();
         setAccelDebugInfo(debugInfo);
-        if (motion.accelerationIncludingGravity.x !== null && motion.accelerationIncludingGravity.y !== null && motion.accelerationIncludingGravity.z !== null) {
+        
+        if (motion.accelerationIncludingGravity.x !== null && 
+            motion.accelerationIncludingGravity.y !== null && 
+            motion.accelerationIncludingGravity.z !== null) {
           setAccelerometerValues({
-            x: motion.accelerationIncludingGravity.x, y: motion.accelerationIncludingGravity.y, z: motion.accelerationIncludingGravity.z,
-            tiltX: debugInfo.tiltX, tiltY: debugInfo.tiltY
+            x: motion.accelerationIncludingGravity.x,
+            y: motion.accelerationIncludingGravity.y,
+            z: motion.accelerationIncludingGravity.z,
+            tiltX: debugInfo.tiltX,
+            tiltY: debugInfo.tiltY
           });
         }
       };
-      const interval = setInterval(updateStatus, 30); 
+      
+      const interval = setInterval(updateStatus, 30);
       return () => clearInterval(interval);
     }
   }, [isThrowing, isVisible, getDeadzoneStatus, getAccelerometerDebugInfo, motion]);
 
-  useEffect(() => { 
-    if (motion && motionAccessGranted) handleMotionUpdate(motion);
-  }, [motion, handleMotionUpdate, motionAccessGranted]);
-
-  // Add effect to handle preset changes and reset any ongoing shadow recordings
+  // Process motion updates
   useEffect(() => {
-    console.log("Preset changed to:", selectedPreset, "Custom results:", customResults);
+    if (motion) {
+      handleMotionUpdate(motion);
+    }
+  }, [motion, handleMotionUpdate]);
+
+  // Standard Three.js setup and materials code...
+  const materials = useMemo(() => {
+    const loader = new THREE.TextureLoader()
     
-    // Force a console log to verify the state is updating
-    if (selectedPreset === 'custom') {
-      console.log("Custom dice results will be:", customResults);
-    } else if (selectedPreset !== 'off') {
-      const preset = RIGGING_PRESETS[selectedPreset];
-      console.log("Using preset:", preset.name, "which generates results like:", preset.generateResults());
-    }
-  }, [selectedPreset, customResults]);
-
-  const materials = useMemo((): THREE.Material[] => {
-    const loader = new THREE.TextureLoader();
     const textures = [
-      "/dice/1.png", "/dice/2.png", "/dice/3.png",
-      "/dice/4.png", "/dice/5.png", "/dice/6.png"
-    ].map(src => loader.load(src));
-    return [
-      new THREE.MeshStandardMaterial({ map: textures[0] }), 
-      new THREE.MeshStandardMaterial({ map: textures[5] }), 
-      new THREE.MeshStandardMaterial({ map: textures[1] }), 
-      new THREE.MeshStandardMaterial({ map: textures[4] }), 
-      new THREE.MeshStandardMaterial({ map: textures[2] }), 
-      new THREE.MeshStandardMaterial({ map: textures[3] })  
+      loader.load("/dice/1.png"),
+      loader.load("/dice/2.png"),
+      loader.load("/dice/3.png"),
+      loader.load("/dice/4.png"),
+      loader.load("/dice/5.png"),
+      loader.load("/dice/6.png")
     ];
-  }, []);
+    
+    return [
+      new THREE.MeshStandardMaterial({ map: textures[0] }),
+      new THREE.MeshStandardMaterial({ map: textures[5] }),
+      new THREE.MeshStandardMaterial({ map: textures[1] }),
+      new THREE.MeshStandardMaterial({ map: textures[4] }),
+      new THREE.MeshStandardMaterial({ map: textures[2] }),
+      new THREE.MeshStandardMaterial({ map: textures[3] })
+    ]
+  }, [])
 
-  const spawnCubesInternal = useCallback((
-    world: CANNON.World,
-    cubePhysMaterial: CANNON.Material,
-    diceFaceMaterials: THREE.Material[], 
-    targetInitialPositionsRef: React.MutableRefObject<CANNON.Vec3[]>,
-    options: {
-      scene?: THREE.Scene;
-      initialYOffset: number; 
-      addToScene: boolean;
-    }
-  ): Cube[] => {
-    const newCubes: Cube[] = [];
-    const initialPositionsArray: CANNON.Vec3[] = [];
-    const geometry = new THREE.BoxGeometry(1.6, 1.6, 1.6);
-    const { scene, initialYOffset, addToScene } = options;
-
-    for (let i = 0; i < 3; i++) {
-      const cubeMesh = new THREE.Mesh(geometry, diceFaceMaterials); 
-      const initialPos = new CANNON.Vec3(-2 + i * 2, initialYOffset, 5);
-      initialPositionsArray.push(initialPos.clone());
-
-      const bodyInitialY = initialPos.y + SHADOW_FLOAT_BASE_Y_OFFSET;
-
-      if (addToScene && scene) {
-        cubeMesh.position.set(initialPos.x, bodyInitialY, initialPos.z);
-        scene.add(cubeMesh);
+  const spawnCubes = useCallback(
+    (scene: THREE.Scene, world: CANNON.World, cubeMaterial: CANNON.Material): Cube[] => {
+      const cubes: Cube[] = []
+      const initialPositions: CANNON.Vec3[] = []
+      const geometry = new THREE.BoxGeometry(1.6, 1.6, 1.6)
+  
+      for (let i = 0; i < 3; i++) {
+        const cubeMesh = new THREE.Mesh(geometry, materials)
+        cubeMesh.position.set(0, 7, 2)
+        scene.add(cubeMesh)
+        
+        const initialPos = new CANNON.Vec3(-2 + i * 2, 7, 2)
+        initialPositions.push(initialPos.clone())
+  
+        const cubeShape = new CANNON.Box(new CANNON.Vec3(0.8, 0.8, 0.8))
+        
+        const cubeBody = new CANNON.Body({
+          mass: 2.0,
+          shape: cubeShape,
+          position: initialPos,
+          material: cubeMaterial,
+          sleepSpeedLimit: 0.05,
+          sleepTimeLimit: 0.05,
+          allowSleep: false
+        })
+  
+        cubeBody.updateMassProperties()
+        cubeBody.angularDamping = 0.2 
+        cubeBody.linearDamping = 0.1  
+        cubeBody.collisionResponse = true
+        cubeBody.material = cubeMaterial;
+        cubeBody.wakeUp();
+        
+        world.addBody(cubeBody)
+        
+        cubes.push({ mesh: cubeMesh, body: cubeBody })
       }
 
-      const cubeShape = new CANNON.Box(new CANNON.Vec3(0.8, 0.8, 0.8));
-      const cubeBody = new CANNON.Body({
-        mass: 2.0, shape: cubeShape, 
-        position: new CANNON.Vec3(initialPos.x, bodyInitialY, initialPos.z), 
-        material: cubePhysMaterial,
-        sleepSpeedLimit: 0.1, sleepTimeLimit: 0.2, allowSleep: true, 
-        angularDamping: 0.1, linearDamping: 0.1, 
-      });
-      cubeBody.updateMassProperties();
-      cubeBody.wakeUp();
-      world.addBody(cubeBody);
-      newCubes.push({ mesh: cubeMesh, body: cubeBody });
-    }
-    targetInitialPositionsRef.current = initialPositionsArray;
-    return newCubes;
-  }, []);
+      initialPositionsRef.current = initialPositions;
+      return cubes
+    },
+    [materials],
+  )
 
-  useWindowResize(() => { 
+  const spawnShadowCubes = useCallback(
+    (world: CANNON.World, cubeMaterial: CANNON.Material): Cube[] => {
+      const cubes: Cube[] = []
+      const initialPositions: CANNON.Vec3[] = []
+      const geometry = new THREE.BoxGeometry(1.6, 1.6, 1.6)
+  
+      for (let i = 0; i < 3; i++) {
+        // Shadow cubes don't need meshes - they're invisible
+        const cubeMesh = new THREE.Mesh(geometry, materials)
+        
+        const initialPos = new CANNON.Vec3(-2 + i * 2, 7, 2)
+        initialPositions.push(initialPos.clone())
+  
+        const cubeShape = new CANNON.Box(new CANNON.Vec3(0.8, 0.8, 0.8))
+        
+        const cubeBody = new CANNON.Body({
+          mass: 2.0,
+          shape: cubeShape,
+          position: initialPos,
+          material: cubeMaterial,
+          sleepSpeedLimit: 0.05,
+          sleepTimeLimit: 0.05,
+          allowSleep: false
+        })
+  
+        cubeBody.updateMassProperties()
+        cubeBody.angularDamping = 0.2 
+        cubeBody.linearDamping = 0.1  
+        cubeBody.collisionResponse = true
+        cubeBody.material = cubeMaterial;
+        cubeBody.wakeUp();
+        
+        world.addBody(cubeBody)
+        
+        cubes.push({ mesh: cubeMesh, body: cubeBody })
+      }
+
+      shadowInitialPositionsRef.current = initialPositions;
+      return cubes
+    },
+    [materials],
+  )
+
+  // Setup three.js scene
+  useWindowResize(() => {
     if (cameraRef.current && rendererRef.current) {
-        cameraRef.current.aspect = window.innerWidth / window.innerHeight;
-        cameraRef.current.updateProjectionMatrix();
-        rendererRef.current.setSize(window.innerWidth, window.innerHeight);
+      cameraRef.current.aspect = window.innerWidth / window.innerHeight
+      cameraRef.current.updateProjectionMatrix()
+      rendererRef.current.setSize(window.innerWidth, window.innerHeight)
     }
-  });
-  const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
-  const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
+  })
 
-  useEffect(() => { 
-    if (!mountRef.current) return;
+  const cameraRef = useRef<THREE.PerspectiveCamera | null>(null)
+  const rendererRef = useRef<THREE.WebGLRenderer | null>(null)
 
-    const scene = new THREE.Scene();
-    cameraRef.current = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
-    cameraRef.current.position.set(0, 8, 15); 
-    cameraRef.current.lookAt(new THREE.Vector3(0, 2, 0));
+  // Toggle debug mode function
+  const toggleDebugMode = useCallback(() => {
+    setDebugMode(!debugMode)
+  }, [debugMode])
 
-    rendererRef.current = new THREE.WebGLRenderer({ antialias: true, alpha: true });
-    rendererRef.current.setSize(window.innerWidth, window.innerHeight);
-    rendererRef.current.setClearColor(0x000000, 0);
-    mountRef.current.appendChild(rendererRef.current.domElement);
+  useEffect(() => {
+    if (!mountRef.current) return
 
-    worldRef.current = new CANNON.World();
-    worldRef.current.gravity.set(0, -1, 0); 
-    worldRef.current.allowSleep = true;
-    worldRef.current.defaultContactMaterial.friction = 0.2;
-    worldRef.current.defaultContactMaterial.restitution = 0.3;
-    (worldRef.current.solver as any).iterations = 25;
-    (worldRef.current.solver as any).tolerance = 0.001;
+    const scene = new THREE.Scene()
+    const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000)
+    camera.position.set(0, 5, 12)
+    camera.lookAt(new THREE.Vector3(0, 1, 0))
+    cameraRef.current = camera
 
-    shadowWorldRef.current = new CANNON.World();
-    shadowWorldRef.current.gravity.set(0, -1, 0); 
-    shadowWorldRef.current.allowSleep = true;
-    shadowWorldRef.current.defaultContactMaterial.friction = 0.2;
-    shadowWorldRef.current.defaultContactMaterial.restitution = 0.3;
-    (shadowWorldRef.current.solver as any).iterations = 25;
-    (shadowWorldRef.current.solver as any).tolerance = 0.001;
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true })
+    renderer.setSize(window.innerWidth, window.innerHeight)
+    renderer.setClearColor(0x000000, 0)
+    rendererRef.current = renderer
 
-    const cubeMaterial = new CANNON.Material("cubeMaterial");
-    const wallMaterial = new CANNON.Material("wallMaterial");
-    const cubeWallContact = new CANNON.ContactMaterial(cubeMaterial, wallMaterial, { friction: 0.4, restitution: 0.2, contactEquationStiffness: 1e8, contactEquationRelaxation: 3 });
-    const cubeCubeContact = new CANNON.ContactMaterial(cubeMaterial, cubeMaterial, { friction: 0.8, restitution: 0.2, contactEquationStiffness: 5e7 });
+    const mountElement = mountRef.current
+    mountElement.appendChild(renderer.domElement)
 
-    worldRef.current.addContactMaterial(cubeWallContact);
-    worldRef.current.addContactMaterial(cubeCubeContact);
-    shadowWorldRef.current.addContactMaterial(cubeWallContact);
-    shadowWorldRef.current.addContactMaterial(cubeCubeContact);
+    // Main world setup
+    const world = new CANNON.World()
+    world.gravity.set(0, -1, 0)
+    world.allowSleep = true
+    world.defaultContactMaterial.friction = 0.2  
+    world.defaultContactMaterial.restitution = 0.3  
+    worldRef.current = world
 
-    actualSpawnWalls(worldRef.current, wallMaterial, { scene, addToScene: true });
-    actualSpawnWalls(shadowWorldRef.current, wallMaterial, { addToScene: false });
+    // Shadow world setup
+    const shadowWorld = new CANNON.World()
+    shadowWorld.gravity.set(0, -1, 0)
+    shadowWorld.allowSleep = true
+    shadowWorld.defaultContactMaterial.friction = 0.2  
+    shadowWorld.defaultContactMaterial.restitution = 0.3  
+    shadowWorldRef.current = shadowWorld
 
-    const baseInitialY = 3.0; 
-    cubesRef.current = spawnCubesInternal(worldRef.current, cubeMaterial, materials, initialPositionsRef, { scene, initialYOffset: baseInitialY, addToScene: true });
-    shadowCubesRef.current = spawnCubesInternal(shadowWorldRef.current, cubeMaterial, materials, shadowInitialPositionsRef, { initialYOffset: baseInitialY, addToScene: false });
+    // Initialize Cannon Debugger for main world
+    cannonDebuggerRef.current = CannonDebugger(scene, world, {
+      color: 0x00ff00,
+    })
+
+    // Initialize Shadow Debugger
+    if (shadowWorld) {
+      shadowDebuggerRef.current = CannonDebugger(scene, shadowWorld, {
+        color: 0xff0000, // Red for shadow
+        scale: 1.01,
+        onInit(body: CANNON.Body, mesh: THREE.Mesh) {
+          if (mesh.material instanceof THREE.MeshBasicMaterial) {
+            mesh.material.wireframe = true;
+            mesh.material.color.setHex(0xff0000);
+            mesh.material.transparent = true;
+            mesh.material.opacity = 0.6;
+          }
+          mesh.visible = showShadowDebug;
+        }
+      });
+    }
+
+    if ('iterations' in world.solver) {
+      (world.solver as any).iterations = 25; 
+    }
+    if ('tolerance' in world.solver) {
+      (world.solver as any).tolerance = 0.001;
+    }
+
+    if ('iterations' in shadowWorld.solver) {
+      (shadowWorld.solver as any).iterations = 25; 
+    }
+    if ('tolerance' in shadowWorld.solver) {
+      (shadowWorld.solver as any).tolerance = 0.001;
+    }
+
+    const cubeMaterial = new CANNON.Material("cubeMaterial")
+    const wallMaterial = new CANNON.Material("wallMaterial")
+
+    const cubeWallContact = new CANNON.ContactMaterial(cubeMaterial, wallMaterial, {
+      friction: 0.4,
+      restitution: 0.2,
+      contactEquationStiffness: 1e8,  
+      contactEquationRelaxation: 3,   
+      frictionEquationStiffness: 1e8, 
+    })
     
-    const setupTimer = setTimeout(() => {
-      createMainDiceConstraints(); 
-      initMainDiceFloating(); 
-      resetShadowDiceToFloatingState(); 
+    const cubeCubeContact = new CANNON.ContactMaterial(cubeMaterial, cubeMaterial, {
+      friction: 0.8,         
+      restitution: 0.2,      
+      contactEquationStiffness: 5e7,  
+      frictionEquationStiffness: 5e7, 
+    })
+
+    world.addContactMaterial(cubeWallContact)
+    world.addContactMaterial(cubeCubeContact)
+    
+    shadowWorld.addContactMaterial(cubeWallContact)
+    shadowWorld.addContactMaterial(cubeCubeContact)
+
+    spawnWalls(world, scene, wallMaterial)
+    spawnWalls(shadowWorld, scene, wallMaterial) // Shadow walls don't need to be added to scene
+    
+    cubesRef.current = spawnCubes(scene, world, cubeMaterial)
+    shadowCubesRef.current = spawnShadowCubes(shadowWorld, cubeMaterial)
+    
+    // Create constraints after cubes are spawned
+    setTimeout(() => {
+      createDiceConstraints();
+      createShadowDiceConstraints();
+      
+      setTimeout(() => {
+        if (!floatingInitializedRef.current) {
+          console.log("Auto-initializing floating animation");
+          initFloating();
+          floatingInitializedRef.current = true;
+          setIsFloating(true);
+        }
+      }, 100);
     }, 100);
 
-    const light = new THREE.DirectionalLight(0xffffff, 1.5); 
-    light.position.set(5,15,10); scene.add(light);
-    const ambientLight = new THREE.AmbientLight(0xffffff, 0.6); scene.add(ambientLight);
+    const light = new THREE.DirectionalLight(0xffffff, 1)
+    light.position.set(5, 10, 5)
+    scene.add(light)
+
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.4)
+    scene.add(ambientLight)
 
     const timeStep = 1 / 60;
-    let animationFrameHandle: number;
-    const animate = () => {
-      animationFrameHandle = requestAnimationFrame(animate);
-      worldRef.current?.step(timeStep);
-      shadowWorldRef.current?.step(timeStep);
+    
+    const animate = (time: number) => {
+      requestAnimationFrame(animate)
+      world.step(timeStep);
+      shadowWorld.step(timeStep);
 
-      // Check for ground collision and zero velocities
-      cubesRef.current.forEach((cube) => { 
-        // Update mesh position and rotation first
-        cube.mesh.position.copy(cube.body.position as unknown as THREE.Vector3);
-        cube.mesh.quaternion.copy(cube.body.quaternion as unknown as THREE.Quaternion);
+      // Sync shadow dice with main dice when not recording
+      syncShadowDiceWithMain();
+
+      // Update cannon debugger if debug mode is enabled
+      if (debugMode && cannonDebuggerRef.current) {
+        cannonDebuggerRef.current.update()
+      }
+
+      // Update shadow debugger if enabled
+      if (shadowDebuggerRef.current && showShadowDebug) {
+        shadowDebuggerRef.current.update()
+      }
+
+      cubesRef.current.forEach((cube, index) => {
+        // Handle boundary checks and reset if needed
+        if (Math.abs(cube.body.position.x) > 20 || 
+            cube.body.position.y < -20 || 
+            cube.body.position.y > 30 || 
+            Math.abs(cube.body.position.z) > 20) {
+          if (initialPositionsRef.current.length > 0) {
+            const cubeIndex = cubesRef.current.indexOf(cube);
+            if (cubeIndex >= 0 && cubeIndex < initialPositionsRef.current.length) {
+              cube.body.position.copy(initialPositionsRef.current[cubeIndex]);
+              cube.body.velocity.set(0, 0, 0);
+              cube.body.angularVelocity.set(0, 0, 0);
+            }
+          }
+        }
         
-        // Check if cube has hit the ground (considering cube is 1.6x1.6x1.6, so half height is 0.8)
-        const groundLevel = 0.8;
-        if (cube.body.position.y <= groundLevel + 0.05) { // Very small buffer for ground contact
-          // Immediately stop all movement when touching ground
-          cube.body.velocity.set(0, 0, 0);
-          cube.body.angularVelocity.set(0, 0, 0);
-          
-          // Snap to exact ground position to prevent any bouncing
-          cube.body.position.y = groundLevel;
-          
-          // Make the cube static to prevent any further physics interactions
-          cube.body.type = CANNON.Body.STATIC;
-        }
+        // Update cube mesh position and rotation
+        cube.mesh.position.copy(cube.body.position);
+        cube.mesh.quaternion.copy(cube.body.quaternion);
       });
-      
-      rendererRef.current?.render(scene, cameraRef.current!);
-    };
-    animate();
 
-    const handleResize = () => { 
-        if (cameraRef.current && rendererRef.current) {
-            cameraRef.current.aspect = window.innerWidth / window.innerHeight;
-            cameraRef.current.updateProjectionMatrix();
-            rendererRef.current.setSize(window.innerWidth, window.innerHeight);
-        }
-    }; 
-    window.addEventListener("resize", handleResize);
+      renderer.render(scene, camera)
+    }
+    
+    animate(0)
+
+    const handleResize = () => {
+      camera.aspect = window.innerWidth / window.innerHeight
+      camera.updateProjectionMatrix()
+      renderer.setSize(window.innerWidth , window.innerHeight)
+    }
+    window.addEventListener("resize", handleResize)
 
     return () => {
-      clearTimeout(setupTimer);
-      cancelAnimationFrame(animationFrameHandle);
-      window.removeEventListener("resize", handleResize);
-      if (mountRef.current && rendererRef.current?.domElement) {
-        mountRef.current.removeChild(rendererRef.current.domElement);
+      window.removeEventListener("resize", handleResize)
+      if (mountElement && renderer.domElement) {
+        mountElement.removeChild(renderer.domElement)
       }
-    };
-  }, [spawnCubesInternal, materials, createMainDiceConstraints, initMainDiceFloating, resetShadowDiceToFloatingState]);
+    }
+  }, [spawnCubes, spawnShadowCubes, createDiceConstraints, createShadowDiceConstraints, initFloating, debugMode, showShadowDebug, syncShadowDiceWithMain])
 
-  const handleRequestAccess = async () => { 
-    const result = await requestMotionAccess();
+  // Request access to device motion sensors
+  const handleRequestAccess = async () => {
+    const result = await requestMotionAccess()
+    setAccessGranted(result)
+    
     if (result) {
       neutralPositionSetRef.current = false;
       setMovementUnlocked(false);
+      setIsFloating(true);
+      
       if (!floatingInitializedRef.current) {
-        initMainDiceFloating();
-        floatingInitializedRef.current = true;
+        setTimeout(() => {
+          initFloating();
+          floatingInitializedRef.current = true;
+        }, 100);
       }
     }
-   }; 
-  useEffect(() => { 
+  }
+
+  // Handle dice roll results and roll screen
+  useEffect(() => {
     if (rollResults.length > 0 && !isThrowing) {
-      disableMovement(); 
+      disableMovement();
       setVisible(true);
     }
   }, [rollResults, isThrowing, disableMovement]);
 
+  // Handle roll screen close
   const handleCloseRollScreen = useCallback(() => {
     setVisible(false);
+    
     setTimeout(() => {
-      resetMainDicePositions(); 
-      if(motion) calibrate(motion); 
-      setMovementUnlocked(false); 
-      if (!isMainFloatingMode()) {
-        initMainDiceFloating();
-      }
-    }, rollScreenAnimationTimeRef.current + 50); 
-  }, [resetMainDicePositions, motion, calibrate, initMainDiceFloating, isMainFloatingMode]);
+      resetDicePositions();
+      if(motion) calibrate(motion)
+      
+      setTimeout(() => {
+        createDiceConstraints();
+        setMovementUnlocked(false);
+        setIsFloating(true);
+        initFloating();
+        floatingInitializedRef.current = true;
+        
+        console.log("Roll cycle complete. Movement locked - waiting for shake.");
+      }, rollScreenAnimationTimeRef.current);
+    }, 50);
+  }, [resetDicePositions, createDiceConstraints, motion, calibrate, initFloating]);
 
-  const diceTotal = useMemo(() => rollResults.reduce((sum, value) => sum + value, 0), [rollResults]);
-  useEffect(() => { if (isVisible) disableMovement(); }, [isVisible, disableMovement]);
-  const handleForceThrowMainGame = useCallback(() => forceThrow(1.5), [forceThrow]);
-  const handleRecalibrateMainGame = useCallback(() => {
+  // Calculate total of dice values
+  const diceTotal = useMemo(() => {
+    return rollResults.reduce((sum, value) => sum + value, 0);
+  }, [rollResults]);
+
+  // Disable movement when roll screen is visible
+  useEffect(() => {
+    if (isVisible) {
+      disableMovement();
+    }
+  }, [isVisible, disableMovement]);
+
+  // Debug forced throw
+  const handleForceThrow = useCallback(() => {
+    forceThrow(1.5);
+  }, [forceThrow]);
+
+  // Function to recalibrate the accelerometer
+  const handleRecalibrate = useCallback(() => {
     if (motion) {
       calibrate(motion);
       setMovementUnlocked(false);
-      initMainDiceFloating(); 
+      setIsFloating(true);
+      initFloating();
+      
+      console.log("Recalibrated. Movement locked - waiting for shake.");
     }
-  }, [motion, calibrate, initMainDiceFloating]);
+  }, [motion, calibrate, initFloating]);
 
   return (
     <>
-      <button onClick={handleRequestAccess} className="fixed top-[20px] left-1/2 -translate-x-1/2 w-[200px] h-10 z-[99] bg-blue-500 text-white rounded-md">
-         {motionAccessGranted ? "Access Granted" : "Enable Sensors"}
+      <button
+        className="fixed top-[20px] left-1/2 -translate-x-1/2 w-[200px] h-10 z-[99] bg-blue-500 text-white rounded-md"
+        onClick={handleRequestAccess}
+      >
+        {motionAccessGranted ? "Access Granted" : "Enable Sensors"}
       </button>
-      
-      {/* Rigging status and preset selector */}
-      <div className="fixed top-[20px] right-[20px] z-[99] flex flex-col items-end space-y-2">
-        <div className={`preset-menu ${RIGGING_PRESETS[selectedPreset].color} text-white px-3 py-1 rounded-md text-sm font-bold flex items-center space-x-2`}>
-          <span>{selectedPreset === 'off' ? 'RIGGING: OFF' : `PRESET: ${RIGGING_PRESETS[selectedPreset].name.toUpperCase()}`}</span>
-          <button 
-            onClick={() => setShowPresetMenu(!showPresetMenu)}
-            className="bg-white bg-opacity-20 hover:bg-opacity-30 rounded px-2 py-0.5 text-xs transition-colors"
-          >
-            ⚙️
-          </button>
-        </div>
+
+   
         
-        {/* Debug indicator to show current expected results */}
-        {selectedPreset !== 'off' && (
-          <div className="bg-black bg-opacity-70 text-white px-2 py-1 rounded text-xs">
-            Expected: {selectedPreset === 'custom' 
-              ? `[${customResults.join(', ')}] = ${customResults.reduce((a, b) => a + b, 0)}`
-              : `${RIGGING_PRESETS[selectedPreset].description}`
-            }
-          </div>
-        )}
-        
-        {showPresetMenu && (
-          <div className="preset-menu bg-gray-900 text-white rounded-lg p-4 min-w-[280px] shadow-xl border border-gray-700">
-            <h3 className="font-bold mb-3 text-center">Rigging Presets</h3>
-            <div className="space-y-2">
-              {(Object.keys(RIGGING_PRESETS) as RiggingPreset[]).map((preset) => {
-                const config = RIGGING_PRESETS[preset];
-                return (
-                  <button
-                    key={preset}
-                    onClick={() => {
-                      setSelectedPreset(preset);
-                      setShowPresetMenu(false);
-                    }}
-                    className={`w-full text-left p-3 rounded-md border transition-colors ${
-                      selectedPreset === preset 
-                        ? `${config.color} border-white text-white` 
-                        : 'bg-gray-800 border-gray-600 hover:bg-gray-700 text-gray-200'
-                    }`}
-                  >
-                    <div className="font-semibold">{config.name}</div>
-                    <div className="text-sm opacity-80">{config.description}</div>
-                  </button>
-                );
-              })}
-            </div>
-            
-            {selectedPreset === 'custom' && (
-              <div className="mt-4 pt-4 border-t border-gray-600">
-                <div className="text-sm font-semibold mb-2">Custom Results:</div>
-                <div className="flex space-x-2">
-                  {customResults.map((value, index) => (
-                    <div key={index} className="flex flex-col items-center">
-                      <label className="text-xs mb-1">Die {index + 1}</label>
-                      <select
-                        value={value}
-                        onChange={(e) => {
-                          const newResults = [...customResults];
-                          newResults[index] = parseInt(e.target.value);
-                          setCustomResults(newResults);
-                        }}
-                        className="bg-gray-700 text-white rounded px-2 py-1 text-sm border border-gray-600"
-                      >
-                        {[1, 2, 3, 4, 5, 6].map(num => (
-                          <option key={num} value={num}>{num}</option>
-                        ))}
-                      </select>
-                    </div>
-                  ))}
-                </div>
-                <div className="text-xs text-gray-400 mt-2 text-center">
-                  Total: {customResults.reduce((a, b) => a + b, 0)}
-                </div>
+       
+
+
+      {/* On-screen dice results display */}
+      {rollResults.length > 0 && !isThrowing && (
+        <div className="fixed bottom-8 left-1/2 -translate-x-1/2 z-[100] flex flex-col items-center">
+          <div className="flex space-x-4 mb-2">
+            {rollResults.map((value, index) => (
+              <div 
+                key={index} 
+                className="w-15 h-14 bg-white rounded-lg flex items-center justify-center"
+                style={{
+                  border: '3px solid #333',
+                  boxShadow: '0 4px 8px rgba(0, 0, 0, 0.5)',
+                  position: 'relative'
+                }}
+              >
+                <span className="text-4xl font-extrabold" style={{ color: '#000' }}>
+                  {value}
+                </span>
               </div>
-            )}
-            
-            <button
-              onClick={() => setShowPresetMenu(false)}
-              className="w-full mt-4 bg-gray-700 hover:bg-gray-600 text-white rounded-md py-2 text-sm transition-colors"
-            >
-              Close
-            </button>
+            ))}
           </div>
-        )}
-      </div>
-      
-      <RollScreen isVisible={isVisible} result={rollResults} onClose={handleCloseRollScreen} />
+          
+          <div 
+            className="bg-black text-white py-2 px-6 rounded-full font-bold text-xl"
+            style={{ boxShadow: '0 2px 6px rgba(0, 0, 0, 0.3)' }}
+          >
+            Total: {diceTotal}
+          </div>
+        </div>
+      )}
+
+          <RollScreen 
+        isVisible={isVisible} 
+        result={rollResults} 
+        onClose={handleCloseRollScreen} 
+      />
+
       <div 
         ref={mountRef} 
         className={`fixed top-0 left-0 w-screen h-screen overflow-hidden ${className || ""}`} 
@@ -1428,5 +1715,5 @@ const resetShadowDiceToFloatingState = useCallback(() => {
         }}
       />
     </>
-  );
-};
+  )
+}

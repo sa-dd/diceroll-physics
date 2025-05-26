@@ -1,11 +1,10 @@
 export const PLAY_AREA = {
-  // Making all dimensions equal to create a cube
-  minX: -6,
-  maxX: 6,
-  minY: -9,
+  minX: -5,
+  maxX: 5,
+  minY: -10,
   maxY: 10,
-  minZ: -26,
-  maxZ: 6,
-}
+  minZ: -20,
+  maxZ: 15,
+};
 
-export const WALL_THICKNESS = 5.5
+export const WALL_THICKNESS = 5.5;
