@@ -1674,14 +1674,39 @@ export const DiceGame: React.FC<Props> = ({ className }) => {
     }
   }
 
-  // Handle dice roll results and roll screen
-  useEffect(() => {
-    if (rollResults.length > 0 && !isThrowing) {
-      disableMovement();
-      setVisible(true);
-    }
-  }, [rollResults, isThrowing, disableMovement]);
-
+// Handle dice roll results and roll screen with auto-close timer
+useEffect(() => {
+  if (rollResults.length > 0 && !isThrowing) {
+    disableMovement();
+    setVisible(true);
+    
+    // Set auto-close timer
+    const autoCloseTimer = setTimeout(() => {
+      console.log("Auto-closing result screen");
+      setVisible(false);
+      
+      // Reset game after screen closes
+      setTimeout(() => {
+        resetDicePositions();
+        if (motionReady && motion) calibrate(motion);
+        
+        setTimeout(() => {
+          createDiceConstraints();
+          setMovementUnlocked(false);
+          setIsFloating(true);
+          initFloating();
+          floatingInitializedRef.current = true;
+          console.log("Auto-reset complete");
+        }, rollScreenAnimationTimeRef.current);
+      }, 50);
+    }, 1500); // 5 seconds
+    
+    // Cleanup function to clear timer if component unmounts or effect re-runs
+    return () => {
+      clearTimeout(autoCloseTimer);
+    };
+  }
+}, [rollResults, isThrowing]); // Simplified dependencies
   // Handle roll screen close
   const handleCloseRollScreen = useCallback(() => {
     setVisible(false);
