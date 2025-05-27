@@ -77,6 +77,8 @@ const TRANSITION_FRAMES = 15
 const VELOCITY_SETTLE_THRESHOLD = 2.0
 const MIDAIR_HEIGHT_THRESHOLD = 5.0
 const PHYSICS_INFLUENCE_FRAMES = 40
+const FLOAT_BASE_HEIGHT = 3.0;
+
 
 // Face orientation mapping
 const FACE_VALUE_TO_NORMAL = new Map<number, THREE.Vector3>([
@@ -843,42 +845,7 @@ export const DiceGame: React.FC<Props> = ({ className }) => {
     targetConstraints.current = [];
   }, []);
 
-  // Function to reset dice to their starting positions
-  const resetDicePositions = useCallback(() => {
-    if (cubesRef.current.length === 0 || initialPositionsRef.current.length === 0) return;
-
-    // First remove all constraints
-    if (worldRef.current && constraintsRef.current.length > 0) {
-      constraintsRef.current.forEach(data => {
-        worldRef.current?.removeConstraint(data.constraint);
-      });
-    }
-
-    cubesRef.current.forEach((cube, index) => {
-      if (index < initialPositionsRef.current.length) {
-        const initialPos = initialPositionsRef.current[index];
-        
-        // Position dice higher to allow for floating
-        cube.body.position.copy(initialPos);
-        cube.body.position.y += 2; // Position higher for floating effect
-        
-        // Reset velocity and rotation
-        cube.body.velocity.set(0, 0, 0);
-        cube.body.angularVelocity.set(0, 0, 0);
-        
-        // Set to awake state
-        cube.body.wakeUp();
-      }
-    });
-
-    // Recreate constraints after resetting positions
-    createDiceConstraints();
-    
-    // Set low gravity if movement is enabled
-    if (isMovementEnabled() && worldRef.current) {
-      worldRef.current.gravity.set(0, -1, 0);
-    }
-  }, []);
+  
 
   // Function to create constraints between dice
   const createDiceConstraints = useCallback(() => {
@@ -897,6 +864,79 @@ export const DiceGame: React.FC<Props> = ({ className }) => {
   const removeAllShadowConstraints = useCallback(() => {
     removeAllGenericConstraints(shadowWorldRef.current, shadowConstraintsRef);
   }, [removeAllGenericConstraints]);
+
+// Function to reset dice to their starting positions
+const resetDicePositions = useCallback(() => {
+  if (cubesRef.current.length === 0 || initialPositionsRef.current.length === 0) return;
+
+  // First remove all constraints
+  if (worldRef.current && constraintsRef.current.length > 0) {
+    constraintsRef.current.forEach(data => {
+      worldRef.current?.removeConstraint(data.constraint);
+    });
+  }
+
+  cubesRef.current.forEach((cube, index) => {
+    if (index < initialPositionsRef.current.length) {
+      const initialPos = initialPositionsRef.current[index];
+      
+      // Set directly to floating height to avoid visual glitch
+      cube.body.position.set(initialPos.x, FLOAT_BASE_HEIGHT, initialPos.z);
+      
+      // Reset velocity and rotation
+      cube.body.velocity.set(0, 0, 0);
+      cube.body.angularVelocity.set(0, 0, 0);
+      
+      // Set physics properties for floating immediately
+      cube.body.type = CANNON.Body.DYNAMIC;
+      cube.body.linearDamping = 0.1; // FLOATING_LINEAR_DAMPING
+      cube.body.angularDamping = 0.1; // FLOATING_ANGULAR_DAMPING
+      
+      // Set to awake state
+      cube.body.wakeUp();
+    }
+  });
+
+  // Set low gravity immediately
+  if (worldRef.current) {
+    worldRef.current.gravity.set(0, -1, 0);
+  }
+
+  // Recreate constraints after resetting positions
+  createDiceConstraints();
+}, [createDiceConstraints ]);
+
+ // Get the updated hook with accelerometer-based movement control
+  const { 
+    handleMotionUpdate, 
+    startThrow,
+    forceThrow,
+    enableMovement, 
+    disableMovement,
+    resetNeutralPosition,
+    getDeadzoneStatus,
+    getAccelerometerDebugInfo,
+    calibrate,
+    isMovementEnabled,
+    isFloatingMode,
+    initFloating,
+    streamFrameToMainDice
+  } = useAccelerometerDice(
+    cubesRef, 
+    isThrowingRef, 
+    setRollResults, 
+    setIsThrowing,
+    resetDicePositions,
+    worldRef,
+    removeAllConstraints,
+    createDiceConstraints,
+    (throwStrength: number, initialState?: DiceState[]) => {
+      // Set up streaming callback before starting shadow throw
+      shadowRecordingRef.current.streamingCallback = streamFrameToMainDice;
+      return executeShadowThrow(throwStrength, initialState);
+    }
+  );
+
 
   const getShadowDiceValue = useCallback((cube: Cube): number => {
     const worldUp = new THREE.Vector3(0, 1, 0)
@@ -1186,37 +1226,7 @@ export const DiceGame: React.FC<Props> = ({ className }) => {
     });
   }, [removeAllShadowConstraints, simulateShadowRollFast, applySavedStateToShadowDice, syncShadowDiceWithMain]);
 
-  // Get the updated hook with accelerometer-based movement control
-  const { 
-    handleMotionUpdate, 
-    startThrow,
-    forceThrow,
-    enableMovement, 
-    disableMovement,
-    resetNeutralPosition,
-    getDeadzoneStatus,
-    getAccelerometerDebugInfo,
-    calibrate,
-    isMovementEnabled,
-    isFloatingMode,
-    initFloating,
-    streamFrameToMainDice
-  } = useAccelerometerDice(
-    cubesRef, 
-    isThrowingRef, 
-    setRollResults, 
-    setIsThrowing,
-    resetDicePositions,
-    worldRef,
-    removeAllConstraints,
-    createDiceConstraints,
-    (throwStrength: number, initialState?: DiceState[]) => {
-      // Set up streaming callback before starting shadow throw
-      shadowRecordingRef.current.streamingCallback = streamFrameToMainDice;
-      return executeShadowThrow(throwStrength, initialState);
-    }
-  );
-
+ 
 
   useEffect(() => {
     isThrowingRef.current = isThrowing
