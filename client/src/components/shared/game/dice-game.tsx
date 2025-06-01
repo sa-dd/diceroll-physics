@@ -1360,6 +1360,12 @@ const resetDicePositions = useCallback(() => {
       loader.load("/dice/5.png"),
       loader.load("/dice/6.png")
     ];
+
+textures.forEach(texture => {
+ texture.magFilter = THREE.NearestFilter;
+ texture.minFilter = THREE.NearestFilter;
+ texture.generateMipmaps = false;
+});
     
     return [
       new THREE.MeshStandardMaterial({ map: textures[0] }),
@@ -1487,6 +1493,7 @@ const resetDicePositions = useCallback(() => {
     const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true })
     renderer.setSize(window.innerWidth, window.innerHeight)
     renderer.setClearColor(0x000000, 0)
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     rendererRef.current = renderer
 
     const mountElement = mountRef.current
